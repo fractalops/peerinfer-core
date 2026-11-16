@@ -39,6 +39,31 @@ impl Engine {
         self.0.forward(&tokens).await.map_err(js_err)
     }
 
+    /// Generates up to `max` tokens after the token returned by the last
+    /// `forward` call.
+    pub async fn generate(&mut self, max: usize) -> Result<Vec<u32>, JsError> {
+        let mut out = Vec::with_capacity(max);
+        self.0
+            .generate(max, |t| {
+                out.extend_from_slice(t);
+                true
+            })
+            .await
+            .map_err(js_err)?;
+        Ok(out)
+    }
+
+    /// Sets random sampling. A temperature of 0 selects greedy decoding.
+    #[wasm_bindgen(js_name = setSampling)]
+    pub fn set_sampling(&mut self, temperature: f32, top_p: f32, seed: u32) -> Result<(), JsError> {
+        let s = (temperature > 0.0).then_some(peerinfer_core::Sampling {
+            temperature,
+            top_p,
+            seed: u64::from(seed),
+        });
+        self.0.set_sampling(s).map_err(js_err)
+    }
+
     pub fn reset(&mut self) {
         self.0.reset();
     }

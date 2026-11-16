@@ -86,6 +86,27 @@ struct Pass {
     fixed_y: Option<u32>,
 }
 
+/// Random sampling settings. Without them the engine picks the most
+/// likely token.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sampling {
+    /// Greater than 0.
+    pub temperature: f32,
+    /// In (0, 1]. 1 keeps every token.
+    pub top_p: f32,
+    /// With the same seed and context, the engine picks the same tokens.
+    pub seed: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct SampleParams {
+    temperature: f32,
+    top_p: f32,
+    seed_lo: u32,
+    seed_hi: u32,
+}
+
 /// Runs one model on one GPU device.
 pub struct Engine {
     device: wgpu::Device,
@@ -100,6 +121,10 @@ pub struct Engine {
     logits_read: wgpu::Buffer,
     passes: Vec<Pass>,
     head: Vec<Pass>,
+    sample: Pass,
+    sampling: Option<Sampling>,
+    params: wgpu::Buffer,
+    sample_read: wgpu::Buffer,
     /// Number of positions already in the KV cache.
     pos: usize,
     adapter_info: wgpu::AdapterInfo,
@@ -359,6 +384,22 @@ impl Engine {
             ("EPS", c.rms_norm_eps as f64),
             ("LAST", 1.0),
         ];
+        let probs = storage("probs", c.vocab_size * f);
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("sample params"),
+            size: std::mem::size_of::<SampleParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let sample_read = read("sample_read", 8);
+        let sample = kernels.pass(
+            &device,
+            "sample",
+            &[("V", c.vocab_size as f64)],
+            &[&logits, &probs, &tokens, &history, &step, &params],
+            1,
+            Some(1),
+        )?;
         let head = vec![
             kernels.pass(
                 &device,
@@ -402,6 +443,10 @@ impl Engine {
             logits_read,
             passes,
             head,
+            sample,
+            sampling: None,
+            params,
+            sample_read,
             pos: 0,
             adapter_info,
             timestamps: device_has_timestamps,
@@ -531,7 +576,7 @@ impl Engine {
         if !self.timestamps {
             return Ok(Vec::new());
         }
-        let passes: Vec<&Pass> = self.passes.iter().chain(&self.head).collect();
+        let passes: Vec<&Pass> = self.passes.iter().chain(self.head_passes()).collect();
         let count = 2 * passes.len() as u32;
         let set = self.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("profile"),
@@ -592,6 +637,62 @@ impl Engine {
         Ok(totals)
     }
 
+    /// Final norm, LM head, then argmax or the sampler.
+    fn head_passes(&self) -> impl Iterator<Item = &Pass> {
+        let last = if self.sampling.is_some() {
+            &self.sample
+        } else {
+            &self.head[2]
+        };
+        self.head[..2].iter().chain(std::iter::once(last))
+    }
+
+    /// Sets random sampling, or greedy decoding with `None`.
+    pub fn set_sampling(&mut self, sampling: Option<Sampling>) -> Result<()> {
+        if let Some(s) = sampling {
+            ensure!(s.temperature > 0.0, "temperature must be greater than 0");
+            ensure!(s.top_p > 0.0 && s.top_p <= 1.0, "top_p must be in (0, 1]");
+            self.queue.write_buffer(
+                &self.params,
+                0,
+                bytemuck::bytes_of(&SampleParams {
+                    temperature: s.temperature,
+                    top_p: s.top_p,
+                    seed_lo: s.seed as u32,
+                    seed_hi: (s.seed >> 32) as u32,
+                }),
+            );
+        }
+        self.sampling = sampling;
+        Ok(())
+    }
+
+    /// Samples again from the logits of the last forward pass with the
+    /// current settings, without changing the context. Returns the token and
+    /// the raw random word. For tests.
+    pub async fn resample(&mut self) -> Result<(u32, u32)> {
+        ensure!(self.sampling.is_some(), "sampling is not set");
+        self.queue.write_buffer(
+            &self.step,
+            0,
+            bytemuck::bytes_of(&Step {
+                tokens: 0,
+                pos0: self.pos as u32,
+                _pad: [0; 2],
+            }),
+        );
+        let mut enc = self.device.create_command_encoder(&Default::default());
+        {
+            let mut cp = enc.begin_compute_pass(&Default::default());
+            self.sample.dispatch(&mut cp, 1);
+        }
+        enc.copy_buffer_to_buffer(&self.tokens, 0, &self.sample_read, 0, 8);
+        self.queue.submit([enc.finish()]);
+        let bytes = read_buffer(&self.device, &self.sample_read, None).await?;
+        let w: &[u32] = bytemuck::cast_slice(&bytes);
+        Ok((w[0], w[1]))
+    }
+
     /// Encodes one forward pass over `n` tokens already in the token buffer.
     fn encode_step(&mut self, n: usize, with_head: bool) -> wgpu::CommandEncoder {
         self.queue.write_buffer(
@@ -609,7 +710,7 @@ impl Engine {
             let passes = self
                 .passes
                 .iter()
-                .chain(if with_head { &self.head[..] } else { &[] });
+                .chain(self.head_passes().filter(|_| with_head));
             for p in passes {
                 p.dispatch(&mut cp, n);
             }
@@ -679,7 +780,7 @@ struct Kernels {
 
 impl Kernels {
     fn new(device: &wgpu::Device) -> Self {
-        let sources: [(&'static str, &str); 8] = [
+        let sources: [(&'static str, &str); 9] = [
             ("matmul_tiled", include_str!("kernels/matmul_tiled.wgsl")),
             ("matmul_reduce", include_str!("kernels/matmul_reduce.wgsl")),
             ("embed", include_str!("kernels/embed.wgsl")),
@@ -688,6 +789,7 @@ impl Kernels {
             ("rope_kv", include_str!("kernels/rope_kv.wgsl")),
             ("attention", include_str!("kernels/attention.wgsl")),
             ("argmax", include_str!("kernels/argmax.wgsl")),
+            ("sample", include_str!("kernels/sample.wgsl")),
         ];
         let modules = sources
             .into_iter()

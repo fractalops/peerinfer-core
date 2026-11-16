@@ -6,6 +6,9 @@ const params = new URLSearchParams(location.search);
 const PROMPT = Number(params.get("prompt") ?? 128);
 const GEN = Number(params.get("gen") ?? 128);
 const RUNS = Number(params.get("runs") ?? 5);
+// ?temperature=0.7&top_p=0.9 samples; the default is greedy decoding.
+const TEMPERATURE = Number(params.get("temperature") ?? 0);
+const TOP_P = Number(params.get("top_p") ?? 1);
 
 const log = (s) => {
   document.querySelector("#log").textContent += s + "\n";
@@ -30,17 +33,26 @@ async function runOurs() {
   const prefill = [];
   const decode = [];
   for (let run = 0; run <= RUNS; run++) {
+    engine.setSampling(TEMPERATURE, TOP_P, run);
     engine.reset();
     const a = performance.now();
-    let next = await engine.forward(Uint32Array.from(prompt));
+    await engine.forward(Uint32Array.from(prompt));
     const b = performance.now();
-    for (let i = 0; i < GEN; i++) next = await engine.forward(Uint32Array.of(next));
+    const out = await engine.generate(GEN);
     const c = performance.now();
+    if (out.length !== GEN) throw new Error(`generated ${out.length} tokens`);
     if (run === 0) continue;
     prefill.push(PROMPT / ((b - a) / 1000));
     decode.push(GEN / ((c - b) / 1000));
   }
-  return { engine: "peerinfer-core", load, prefill: median(prefill), decode: median(decode) };
+  return {
+    engine: "peerinfer-core",
+    temperature: TEMPERATURE,
+    top_p: TOP_P,
+    load,
+    prefill: median(prefill),
+    decode: median(decode),
+  };
 }
 
 async function runWebLLM() {
@@ -65,7 +77,9 @@ async function runWebLLM() {
     const stream = await engine.chat.completions.create({
       messages: [{ role: "user", content: words }],
       max_tokens: GEN,
-      temperature: 0,
+      temperature: TEMPERATURE,
+      top_p: TOP_P,
+      seed: run,
       ignore_eos: true,
       stream: true,
       stream_options: { include_usage: true },
@@ -83,6 +97,8 @@ async function runWebLLM() {
   }
   return {
     engine: "WebLLM 0.2.88",
+    temperature: TEMPERATURE,
+    top_p: TOP_P,
     load,
     promptTokens,
     prefill: median(prefill),

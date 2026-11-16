@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use peerinfer_core::{Engine, Weights};
+use peerinfer_core::{Engine, Sampling, Weights, philox};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -21,6 +21,22 @@ fn main() -> Result<()> {
                     .context("bad number")
             };
             pollster::block_on(speed(args[1].as_ref(), n(2, 128)?, n(3, 128)?, n(4, 5)?))
+        }
+        Some("sample-check") if args.len() == 2 => {
+            pollster::block_on(sample_check(args[1].as_ref()))
+        }
+        Some("speed-sample") if args.len() >= 2 => {
+            let n = |i: usize, d: usize| {
+                args.get(i)
+                    .map_or(Ok(d), |s| s.parse())
+                    .context("bad number")
+            };
+            pollster::block_on(speed_sample(
+                args[1].as_ref(),
+                n(2, 128)?,
+                n(3, 128)?,
+                n(4, 5)?,
+            ))
         }
         Some("profile") if args.len() >= 2 => {
             let n = args
@@ -181,5 +197,145 @@ async fn profile(model: &std::path::Path, n: usize) -> Result<()> {
         println!("{ms:7.3} ms {:5.1}%  {name}", 100.0 * ms / total);
     }
     println!("{total:7.3} ms GPU time for a pass over {n} tokens after 128 cached tokens");
+    Ok(())
+}
+
+/// Checks the GPU sampler against an exact CPU computation.
+async fn sample_check(model: &std::path::Path) -> Result<()> {
+    let (mut engine, _) = load(model).await?;
+    // Arbitrary tokens, so the next-token distribution is broad.
+    let prompt: Vec<u32> = (0..64u32).map(|i| 1000 + (i * 37) % 20000).collect();
+    engine.forward(&prompt).await?;
+    for (t, top_p) in [(0.8, 0.9), (1.0, 1.0)] {
+        println!("temperature {t}, top-p {top_p}:");
+        sample_case(&mut engine, t, top_p).await?;
+    }
+    Ok(())
+}
+
+#[allow(non_snake_case)]
+async fn sample_case(engine: &mut Engine, T: f32, TOP_P: f32) -> Result<()> {
+    const DRAWS: u64 = 4000;
+    let logits = engine.last_logits().await?;
+    let pos = engine.position() as u32;
+
+    // Exact nucleus in f64: sort by probability, keep the smallest prefix
+    // with at least TOP_P of the mass.
+    let m = logits.iter().fold(f32::MIN, |a, &b| a.max(b)) as f64;
+    let p: Vec<f64> = logits
+        .iter()
+        .map(|&l| ((l as f64 - m) / T as f64).exp())
+        .collect();
+    let total: f64 = p.iter().sum();
+    let mut order: Vec<usize> = (0..p.len()).collect();
+    order.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
+    let mut kept = vec![false; p.len()];
+    let mut mass = 0.0;
+    for &i in &order {
+        kept[i] = true;
+        mass += p[i];
+        if mass >= TOP_P as f64 * total {
+            break;
+        }
+    }
+    let kept_mass: f64 = (0..p.len()).filter(|&i| kept[i]).map(|i| p[i]).sum();
+    let n_kept = kept.iter().filter(|&&k| k).count();
+
+    let mut counts = std::collections::HashMap::<u32, u64>::new();
+    let (mut rng_ok, mut exact, mut outside) = (0, 0, 0);
+    for seed in 0..DRAWS {
+        engine.set_sampling(Some(Sampling {
+            temperature: T,
+            top_p: TOP_P,
+            seed,
+        }))?;
+        let (tok, raw) = engine.resample().await?;
+        let want_raw = philox::philox4x32_10([pos, 0, 0, 0], [seed as u32, (seed >> 32) as u32])[0];
+        rng_ok += u64::from(raw == want_raw);
+        outside += u64::from(!kept[tok as usize]);
+        // The same draw on the CPU: cumulative mass in index order.
+        let u = philox::uniform(seed, pos) as f64 * kept_mass;
+        let mut acc = 0.0;
+        let mut cpu = 0;
+        for i in 0..p.len() {
+            if kept[i] {
+                acc += p[i];
+                cpu = i as u32;
+                if u < acc {
+                    break;
+                }
+            }
+        }
+        exact += u64::from(cpu == tok);
+        *counts.entry(tok).or_default() += 1;
+    }
+    let again = {
+        engine.set_sampling(Some(Sampling {
+            temperature: T,
+            top_p: TOP_P,
+            seed: 7,
+        }))?;
+        let a = engine.resample().await?;
+        let b = engine.resample().await?;
+        a == b
+    };
+    let tvd: f64 = 0.5
+        * (0..p.len())
+            .filter(|&i| kept[i] || counts.contains_key(&(i as u32)))
+            .map(|i| {
+                let want = if kept[i] { p[i] / kept_mass } else { 0.0 };
+                let got = *counts.get(&(i as u32)).unwrap_or(&0) as f64 / DRAWS as f64;
+                (want - got).abs()
+            })
+            .sum::<f64>();
+    println!(
+        "nucleus: {n_kept} tokens; {DRAWS} draws, {} distinct",
+        counts.len()
+    );
+    println!("GPU random words equal to Philox4x32-10: {rng_ok}/{DRAWS}");
+    println!("tokens outside the exact nucleus: {outside}");
+    println!("same token as the CPU for the same random number: {exact}/{DRAWS}");
+    println!(
+        "total variation distance to the exact distribution: {tvd:.4} (sampling noise is about {:.4})",
+        (n_kept as f64 / DRAWS as f64).sqrt() / 2.0
+    );
+    println!("same seed gives the same token: {again}");
+    ensure!(
+        rng_ok == DRAWS && outside == 0 && again,
+        "sampler check failed"
+    );
+    Ok(())
+}
+
+async fn speed_sample(
+    model: &std::path::Path,
+    prompt_len: usize,
+    gen_len: usize,
+    runs: usize,
+) -> Result<()> {
+    let (mut engine, _) = load(model).await?;
+    let prompt: Vec<u32> = (0..prompt_len as u32)
+        .map(|i| 1000 + (i * 37) % 20000)
+        .collect();
+    let mut decode = Vec::new();
+    for run in 0..=runs {
+        engine.set_sampling(Some(Sampling {
+            temperature: 0.7,
+            top_p: 0.9,
+            seed: run as u64,
+        }))?;
+        engine.reset();
+        engine.forward(&prompt).await?;
+        let t1 = Instant::now();
+        engine.generate(gen_len, |_| true).await?;
+        if run > 0 {
+            decode.push(gen_len as f64 / t1.elapsed().as_secs_f64());
+        }
+    }
+    decode.sort_by(f64::total_cmp);
+    println!(
+        "decode with temperature 0.7, top-p 0.9: {:.1} tok/s ({gen_len} tokens, median of {runs})",
+        decode[decode.len() / 2]
+    );
     Ok(())
 }
