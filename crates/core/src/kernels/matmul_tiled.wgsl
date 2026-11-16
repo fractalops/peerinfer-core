@@ -37,27 +37,97 @@ fn scale(i: u32) -> f32 {
     return select(p.x, p.y, (i & 1u) == 1u);
 }
 
-fn nibble(q: u32, j: u32) -> f32 {
-    return f32((q >> (4u * j)) & 15u) - 7.0;
+// One thread's share of a K step, held in registers so that the loads
+// for the next step can overlap with the multiply of the current one.
+struct Fetch {
+    // Inputs for tasks e = li + 64 m: k = e % 32, token group e / 32.
+    xv: array<vec4<f32>, 4>,
+    // Weights for 4 rows of one word, and their scales.
+    q: vec4<u32>,
+    sc: vec4<f32>,
 }
 
-// Dequantizes word `wi` of group `g` for the 4 rows of tile row group
-// `rg` (W rows offset by `off`) into 8 vec4 values.
-fn load_rows(n0: u32, rg: u32, off: u32, g: u32, wi: u32, up: bool) {
-    var q = vec4<u32>();
-    var sc = vec4<f32>();
-    for (var i = 0u; i < 4u; i++) {
-        let row = min(n0 + rg * 4u + i, N - 1u) + off;
-        q[i] = w[row * (K / 8u) + g * 4u + wi];
-        sc[i] = scale(row * (K / 32u) + g);
+fn fetch(g: u32, li: u32, n0: u32, t0: u32, tokens: u32) -> Fetch {
+    var f: Fetch;
+    for (var m = 0u; m < 4u; m++) {
+        let e = li + 64u * m;
+        let k = e % 32u;
+        let tg = e / 32u;
+        let t = t0 + tg * 4u;
+        let b = t * K + g * 32u + k;
+        f.xv[m] = vec4(
+            select(0.0, x[b], t < tokens),
+            select(0.0, x[b + K], t + 1u < tokens),
+            select(0.0, x[b + 2u * K], t + 2u < tokens),
+            select(0.0, x[b + 3u * K], t + 3u < tokens),
+        );
     }
-    for (var j = 0u; j < 8u; j++) {
-        let v = vec4(nibble(q.x, j), nibble(q.y, j), nibble(q.z, j), nibble(q.w, j)) * sc;
-        let idx = (wi * 8u + j) * 8u + rg;
-        if (up) {
-            us[idx] = v;
+    // Threads 0-31 load W rows; threads 32-63 load the up rows (SwiGLU).
+    if (li < 32u || MODE == 2u) {
+        let rg = (li % 32u) / 4u;
+        let off = select(0u, N, li >= 32u);
+        let r = vec4(
+            min(n0 + rg * 4u, N - 1u),
+            min(n0 + rg * 4u + 1u, N - 1u),
+            min(n0 + rg * 4u + 2u, N - 1u),
+            min(n0 + rg * 4u + 3u, N - 1u),
+        ) + vec4(off);
+        let wo = g * 4u + li % 4u;
+        f.q = vec4(w[r.x * (K / 8u) + wo], w[r.y * (K / 8u) + wo], w[r.z * (K / 8u) + wo], w[r.w * (K / 8u) + wo]);
+        f.sc = vec4(
+            scale(r.x * (K / 32u) + g),
+            scale(r.y * (K / 32u) + g),
+            scale(r.z * (K / 32u) + g),
+            scale(r.w * (K / 32u) + g),
+        );
+    }
+    return f;
+}
+
+fn store(f: Fetch, li: u32) {
+    xs[(li % 32u) * 8u + (li + 0u) / 32u] = f.xv[0];
+    xs[(li % 32u) * 8u + (li + 64u) / 32u] = f.xv[1];
+    xs[(li % 32u) * 8u + (li + 128u) / 32u] = f.xv[2];
+    xs[(li % 32u) * 8u + (li + 192u) / 32u] = f.xv[3];
+    if (li < 32u || MODE == 2u) {
+        let rg = (li % 32u) / 4u;
+        let wi = li % 4u;
+        // Low nibbles hold values 0, 2, 4, 6 and high nibbles 1, 3, 5, 7.
+        let lo = mat4x4(
+            unpack4x8unorm(f.q.x & 0x0F0F0F0Fu),
+            unpack4x8unorm(f.q.y & 0x0F0F0F0Fu),
+            unpack4x8unorm(f.q.z & 0x0F0F0F0Fu),
+            unpack4x8unorm(f.q.w & 0x0F0F0F0Fu),
+        );
+        let hi = mat4x4(
+            unpack4x8unorm((f.q.x >> 4u) & 0x0F0F0F0Fu),
+            unpack4x8unorm((f.q.y >> 4u) & 0x0F0F0F0Fu),
+            unpack4x8unorm((f.q.z >> 4u) & 0x0F0F0F0Fu),
+            unpack4x8unorm((f.q.w >> 4u) & 0x0F0F0F0Fu),
+        );
+        // Column r of lo/hi is row r; transpose to get one vec4 per value.
+        let lt = transpose(lo);
+        let ht = transpose(hi);
+        let base = wi * 64u + rg;
+        let sc = f.sc;
+        if (li < 32u) {
+            ws[base + 0u] = (lt[0] * 255.0 - 7.0) * sc;
+            ws[base + 8u] = (ht[0] * 255.0 - 7.0) * sc;
+            ws[base + 16u] = (lt[1] * 255.0 - 7.0) * sc;
+            ws[base + 24u] = (ht[1] * 255.0 - 7.0) * sc;
+            ws[base + 32u] = (lt[2] * 255.0 - 7.0) * sc;
+            ws[base + 40u] = (ht[2] * 255.0 - 7.0) * sc;
+            ws[base + 48u] = (lt[3] * 255.0 - 7.0) * sc;
+            ws[base + 56u] = (ht[3] * 255.0 - 7.0) * sc;
         } else {
-            ws[idx] = v;
+            us[base + 0u] = (lt[0] * 255.0 - 7.0) * sc;
+            us[base + 8u] = (ht[0] * 255.0 - 7.0) * sc;
+            us[base + 16u] = (lt[1] * 255.0 - 7.0) * sc;
+            us[base + 24u] = (ht[1] * 255.0 - 7.0) * sc;
+            us[base + 32u] = (lt[2] * 255.0 - 7.0) * sc;
+            us[base + 40u] = (ht[2] * 255.0 - 7.0) * sc;
+            us[base + 48u] = (lt[3] * 255.0 - 7.0) * sc;
+            us[base + 56u] = (ht[3] * 255.0 - 7.0) * sc;
         }
     }
 }
@@ -75,42 +145,136 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 
     let groups = K / 32u;
     let per = (groups + SPLITS - 1u) / SPLITS;
-    let g_end = min(groups, (wg.z + 1u) * per);
-    for (var g = wg.z * per; g < g_end; g++) {
-        // Inputs: 32 k values x 8 token groups, 4 tasks per thread.
-        for (var e = li; e < 256u; e += 64u) {
-            let k = e % 32u;
-            let tg = e / 32u;
-            var v = vec4<f32>();
-            for (var i = 0u; i < 4u; i++) {
-                let t = t0 + tg * 4u + i;
-                if (t < tokens) {
-                    v[i] = x[t * K + g * 32u + k];
+    let g_start = wg.z * per;
+    let g_end = min(groups, g_start + per);
+    var next = fetch(min(g_start, groups - 1u), li, n0, t0, tokens);
+    for (var g = g_start; g < g_end; g++) {
+        store(next, li);
+        workgroupBarrier();
+        if (g + 1u < g_end) {
+            next = fetch(g + 1u, li, n0, t0, tokens);
+        }
+        // Unrolled by hand: naga emits loops that Metal may not unroll.
+        for (var k = 0u; k < 32u; k += 8u) {
+            {
+                let a = xs[(k + 0u) * 8u + tt];
+                let b = ws[(k + 0u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 0u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
                 }
             }
-            xs[k * 8u + tg] = v;
-        }
-        // Weights: 8 row groups x 4 words. Threads 0-31 load W rows,
-        // threads 32-63 load the up rows for SwiGLU.
-        if (li < 32u) {
-            load_rows(n0, li / 4u, 0u, g, li % 4u, false);
-        } else if (MODE == 2u) {
-            load_rows(n0, (li - 32u) / 4u, N, g, li % 4u, true);
-        }
-        workgroupBarrier();
-        for (var k = 0u; k < 32u; k++) {
-            let a = xs[k * 8u + tt];
-            let b = ws[k * 8u + nn];
-            acc[0] += a * b.x;
-            acc[1] += a * b.y;
-            acc[2] += a * b.z;
-            acc[3] += a * b.w;
-            if (MODE == 2u) {
-                let u = us[k * 8u + nn];
-                acc2[0] += a * u.x;
-                acc2[1] += a * u.y;
-                acc2[2] += a * u.z;
-                acc2[3] += a * u.w;
+            {
+                let a = xs[(k + 1u) * 8u + tt];
+                let b = ws[(k + 1u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 1u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 2u) * 8u + tt];
+                let b = ws[(k + 2u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 2u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 3u) * 8u + tt];
+                let b = ws[(k + 3u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 3u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 4u) * 8u + tt];
+                let b = ws[(k + 4u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 4u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 5u) * 8u + tt];
+                let b = ws[(k + 5u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 5u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 6u) * 8u + tt];
+                let b = ws[(k + 6u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 6u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
+            }
+            {
+                let a = xs[(k + 7u) * 8u + tt];
+                let b = ws[(k + 7u) * 8u + nn];
+                acc[0] += a * b.x;
+                acc[1] += a * b.y;
+                acc[2] += a * b.z;
+                acc[3] += a * b.w;
+                if (MODE == 2u) {
+                    let u = us[(k + 7u) * 8u + nn];
+                    acc2[0] += a * u.x;
+                    acc2[1] += a * u.y;
+                    acc2[2] += a * u.z;
+                    acc2[3] += a * u.w;
+                }
             }
         }
         workgroupBarrier();
