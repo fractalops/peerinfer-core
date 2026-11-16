@@ -14,7 +14,8 @@ override EPS: f32 = 0.0;
 
 const LANES: u32 = 8u;
 const ROWS: u32 = 32u;
-const MAX_WORDS: u32 = 320u; // K <= 2560
+// Input words staged at a time; longer rows run in chunks.
+const MAX_WORDS: u32 = 320u;
 
 @group(0) @binding(0) var<storage, read> x: array<f32>;
 @group(0) @binding(1) var<storage, read> w: array<vec4<u32>>;
@@ -41,12 +42,13 @@ fn word_dot(q: u32, i: u32) -> f32 {
     return dot(lo, xe[i]) + dot(hi, xo[i]);
 }
 
-fn dot_row(row: u32, lane: u32) -> f32 {
+// Groups of this row whose words c0..c1 are staged.
+fn dot_row(row: u32, lane: u32, c0: u32, c1: u32) -> f32 {
     let groups = K / 32u;
     var acc = 0.0;
-    for (var g = lane; g < groups; g += LANES) {
+    for (var g = c0 / 4u + lane; g < c1 / 4u; g += LANES) {
         let q = w[row * groups + g];
-        let i = g * 4u;
+        let i = g * 4u - c0;
         // unpack4x8unorm returns byte / 255.
         let d = 255.0 * (word_dot(q.x, i) + word_dot(q.y, i + 1u) + word_dot(q.z, i + 2u) + word_dot(q.w, i + 3u));
         let off = 7.0 * (xsum[i] + xsum[i + 1u] + xsum[i + 2u] + xsum[i + 3u]);
@@ -77,30 +79,39 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
         inv = inverseSqrt(red[0] / f32(K) + EPS);
         workgroupBarrier();
     }
-    for (var i = li; i < words; i += 256u) {
-        let b = t * K + i * 8u;
-        var e = vec4(x[b], x[b + 2u], x[b + 4u], x[b + 6u]);
-        var o = vec4(x[b + 1u], x[b + 3u], x[b + 5u], x[b + 7u]);
-        if (NORM) {
-            let p0 = unpack2x16float(g[4u * i]);
-            let p1 = unpack2x16float(g[4u * i + 1u]);
-            let p2 = unpack2x16float(g[4u * i + 2u]);
-            let p3 = unpack2x16float(g[4u * i + 3u]);
-            e *= inv * vec4(p0.x, p1.x, p2.x, p3.x);
-            o *= inv * vec4(p0.y, p1.y, p2.y, p3.y);
-        }
-        xe[i] = e;
-        xo[i] = o;
-        xsum[i] = dot(e, vec4(1.0)) + dot(o, vec4(1.0));
-    }
-    workgroupBarrier();
-
     let lane = li % LANES;
     let row = wg.x * ROWS + li / LANES;
     let r = min(row, N - 1u);
-    red[li] = dot_row(r, lane);
+    var acc = 0.0;
+    var acc2 = 0.0;
+    for (var c0 = 0u; c0 < words; c0 += MAX_WORDS) {
+        let c1 = min(words, c0 + MAX_WORDS);
+        for (var i = c0 + li; i < c1; i += 256u) {
+            let b = t * K + i * 8u;
+            var e = vec4(x[b], x[b + 2u], x[b + 4u], x[b + 6u]);
+            var o = vec4(x[b + 1u], x[b + 3u], x[b + 5u], x[b + 7u]);
+            if (NORM) {
+                let p0 = unpack2x16float(g[4u * i]);
+                let p1 = unpack2x16float(g[4u * i + 1u]);
+                let p2 = unpack2x16float(g[4u * i + 2u]);
+                let p3 = unpack2x16float(g[4u * i + 3u]);
+                e *= inv * vec4(p0.x, p1.x, p2.x, p3.x);
+                o *= inv * vec4(p0.y, p1.y, p2.y, p3.y);
+            }
+            xe[i - c0] = e;
+            xo[i - c0] = o;
+            xsum[i - c0] = dot(e, vec4(1.0)) + dot(o, vec4(1.0));
+        }
+        workgroupBarrier();
+        acc += dot_row(r, lane, c0, c1);
+        if (MODE == 2u) {
+            acc2 += dot_row(r + N, lane, c0, c1);
+        }
+        workgroupBarrier();
+    }
+    red[li] = acc;
     if (MODE == 2u) {
-        red2[li] = dot_row(r + N, lane);
+        red2[li] = acc2;
     }
     workgroupBarrier();
     for (var st = LANES / 2u; st > 0u; st >>= 1u) {

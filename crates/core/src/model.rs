@@ -5,7 +5,15 @@ use std::{collections::HashMap, ops::Range};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
-/// Llama-style model shape, read from `mlc-chat-config.json`.
+/// The model families the engine runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arch {
+    Llama,
+    /// Llama with RMSNorm on each query and key head before rotary embedding.
+    Qwen3,
+}
+
+/// Decoder shape, read from `mlc-chat-config.json`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub hidden_size: usize,
@@ -16,8 +24,17 @@ pub struct Config {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub rms_norm_eps: f32,
+    /// Rotary embedding base: `position_embedding_base`, or `rope_theta` in
+    /// Qwen3 configs.
+    #[serde(alias = "rope_theta")]
     pub position_embedding_base: f32,
     pub tie_word_embeddings: bool,
+    #[serde(skip, default = "default_arch")]
+    pub arch: Arch,
+}
+
+fn default_arch() -> Arch {
+    Arch::Llama
 }
 
 impl Config {
@@ -29,24 +46,25 @@ impl Config {
             model_config: Config,
         }
         let file: File = serde_json::from_str(json).context("parse mlc-chat-config.json")?;
-        ensure!(
-            file.model_type == "llama",
-            "unsupported model type {}",
-            file.model_type
-        );
+        let arch = match file.model_type.as_str() {
+            "llama" => Arch::Llama,
+            "qwen3" => Arch::Qwen3,
+            other => bail!("unsupported model type {other}"),
+        };
         ensure!(
             file.quantization == "q4f16_1",
             "unsupported quantization {}",
             file.quantization
         );
-        let c = file.model_config;
+        let mut c = file.model_config;
+        c.arch = arch;
         ensure!(c.tie_word_embeddings, "only tied embeddings are supported");
         ensure!(
             c.num_attention_heads.is_multiple_of(c.num_key_value_heads),
             "attention heads must be a multiple of key-value heads"
         );
         ensure!(
-            c.head_dim.is_multiple_of(2) && c.head_dim <= 128,
+            c.head_dim == 64 || c.head_dim == 128,
             "unsupported head size {}",
             c.head_dim
         );
@@ -57,6 +75,14 @@ impl Config {
             );
         }
         Ok(c)
+    }
+
+    /// Name of the fused query, key and value projection.
+    pub fn qkv_name(&self) -> &'static str {
+        match self.arch {
+            Arch::Llama => "qkv_proj",
+            Arch::Qwen3 => "c_attn",
+        }
     }
 
     pub fn q_dim(&self) -> usize {

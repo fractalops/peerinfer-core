@@ -2,7 +2,7 @@
 
 peerinfer-core runs language models on the GPU with WebGPU. The same Rust code runs in the browser, compiled to WebAssembly, and natively through wgpu. Native runs are tested on Metal only.
 
-It runs Llama-style models in the MLC `q4f16_1` format: 4-bit weights in groups of 32 with f16 scales. It generates tokens greedily or samples them with temperature and top-p. With the same seed and context, it generates the same tokens.
+It runs Llama-style and Qwen3 models in the MLC `q4f16_1` format: 4-bit weights in groups of 32 with f16 scales. It generates tokens greedily or samples them with temperature and top-p. With the same seed and context, it generates the same tokens.
 
 ## Install
 

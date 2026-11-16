@@ -1,4 +1,4 @@
-"""Reference forward pass for SmolLM2 in MLC q4f16_1 format.
+"""Reference forward pass for Llama and Qwen3 models in MLC q4f16_1 format.
 
 Runs on the CPU with NumPy. Used to check the GPU engine.
 
@@ -39,29 +39,30 @@ def dequantize(q_weight: np.ndarray, q_scale: np.ndarray) -> np.ndarray:
 
 
 class Model:
+    """Llama and Qwen3 decoders. Weights stay quantized and are dequantized
+    one layer at a time, so a 4B model fits in memory. Keeps a KV cache."""
+
     def __init__(self, model_dir: Path):
-        cfg = json.loads((model_dir / "mlc-chat-config.json").read_text())["model_config"]
+        chat = json.loads((model_dir / "mlc-chat-config.json").read_text())
+        cfg = chat["model_config"]
         self.cfg = cfg
-        t = load_mlc(model_dir)
+        self.qwen3 = chat["model_type"] == "qwen3"
+        self.base = cfg.get("position_embedding_base") or cfg["rope_theta"]
+        self.t = load_mlc(model_dir)
+        self.qkv_name = "c_attn" if self.qwen3 else "qkv_proj"
+        self.reset()
 
-        def lin(name: str) -> np.ndarray:
-            return dequantize(t[f"{name}.q_weight"], t[f"{name}.q_scale"])
+    def reset(self) -> None:
+        n = self.cfg["num_hidden_layers"]
+        self.k_cache: list[np.ndarray | None] = [None] * n
+        self.v_cache: list[np.ndarray | None] = [None] * n
+        self.pos = 0
 
-        self.embed = lin("model.embed_tokens")
-        self.norm = t["model.norm.weight"].astype(np.float32)
-        self.layers = []
-        for i in range(cfg["num_hidden_layers"]):
-            p = f"model.layers.{i}"
-            self.layers.append(
-                dict(
-                    ln1=t[f"{p}.input_layernorm.weight"].astype(np.float32),
-                    ln2=t[f"{p}.post_attention_layernorm.weight"].astype(np.float32),
-                    qkv=lin(f"{p}.self_attn.qkv_proj"),
-                    o=lin(f"{p}.self_attn.o_proj"),
-                    gate_up=lin(f"{p}.mlp.gate_up_proj"),
-                    down=lin(f"{p}.mlp.down_proj"),
-                )
-            )
+    def lin(self, name: str) -> np.ndarray:
+        return dequantize(self.t[f"{name}.q_weight"], self.t[f"{name}.q_scale"])
+
+    def vec(self, name: str) -> np.ndarray:
+        return self.t[name].astype(np.float32)
 
     def rms(self, x: np.ndarray, w: np.ndarray) -> np.ndarray:
         eps = self.cfg["rms_norm_eps"]
@@ -70,7 +71,7 @@ class Model:
     def rope(self, x: np.ndarray, pos: np.ndarray) -> np.ndarray:
         """x: [T, H, D]. Rotates the two halves of each head (rotate_half)."""
         d = x.shape[-1]
-        inv = 1.0 / (self.cfg["position_embedding_base"] ** (np.arange(0, d, 2, dtype=np.float64) / d))
+        inv = 1.0 / (self.base ** (np.arange(0, d, 2, dtype=np.float64) / d))
         ang = pos[:, None].astype(np.float64) * inv[None, :]
         cos = np.cos(ang).astype(np.float32)[:, None, :]
         sin = np.sin(ang).astype(np.float32)[:, None, :]
@@ -78,31 +79,47 @@ class Model:
         return np.concatenate([a * cos - b * sin, b * cos + a * sin], axis=-1)
 
     def forward(self, tokens: list[int]) -> np.ndarray:
-        """Returns logits for every position, shape [T, vocab]."""
+        """Appends `tokens` to the context and returns the last position's logits."""
         c = self.cfg
-        hq, hkv, d = c["num_attention_heads"], c["num_key_value_heads"], c["head_dim"]
+        hq, hkv = c["num_attention_heads"], c["num_key_value_heads"]
+        d = c.get("head_dim") or c["hidden_size"] // hq
         n = len(tokens)
-        pos = np.arange(n)
-        x = self.embed[np.array(tokens)]
-        mask = np.triu(np.full((n, n), -np.inf, dtype=np.float32), 1)
-        for L in self.layers:
-            h = self.rms(x, L["ln1"]) @ L["qkv"].T
+        pos = np.arange(self.pos, self.pos + n)
+        total = self.pos + n
+        ids = np.array(tokens)
+        x = dequantize(self.t["model.embed_tokens.q_weight"][ids], self.t["model.embed_tokens.q_scale"][ids])
+        mask = np.triu(np.full((n, total), -np.inf, dtype=np.float32), self.pos + 1)
+        for i in range(c["num_hidden_layers"]):
+            p = f"model.layers.{i}"
+            h = self.rms(x, self.vec(f"{p}.input_layernorm.weight")) @ self.lin(f"{p}.self_attn.{self.qkv_name}").T
             q = h[:, : hq * d].reshape(n, hq, d)
             k = h[:, hq * d : (hq + hkv) * d].reshape(n, hkv, d)
             v = h[:, (hq + hkv) * d :].reshape(n, hkv, d)
+            if self.qwen3:
+                q = self.rms(q, self.vec(f"{p}.self_attn.q_norm.weight"))
+                k = self.rms(k, self.vec(f"{p}.self_attn.k_norm.weight"))
             q, k = self.rope(q, pos), self.rope(k, pos)
+            if self.k_cache[i] is not None:
+                k = np.concatenate([self.k_cache[i], k])
+                v = np.concatenate([self.v_cache[i], v])
+            self.k_cache[i], self.v_cache[i] = k, v
             rep = hq // hkv
-            k = np.repeat(k, rep, axis=1)
-            v = np.repeat(v, rep, axis=1)
-            s = np.einsum("thd,shd->hts", q, k) / np.sqrt(d) + mask
+            kr, vr = np.repeat(k, rep, axis=1), np.repeat(v, rep, axis=1)
+            s = np.einsum("thd,shd->hts", q, kr) / np.sqrt(d) + mask
             s = np.exp(s - s.max(-1, keepdims=True))
             s /= s.sum(-1, keepdims=True)
-            a = np.einsum("hts,shd->thd", s, v).reshape(n, hq * d)
-            x = x + a @ L["o"].T
-            gu = self.rms(x, L["ln2"]) @ L["gate_up"].T
+            a = np.einsum("hts,shd->thd", s, vr).reshape(n, hq * d)
+            x = x + a @ self.lin(f"{p}.self_attn.o_proj").T
+            gu = self.rms(x, self.vec(f"{p}.post_attention_layernorm.weight")) @ self.lin(f"{p}.mlp.gate_up_proj").T
             g, u = gu[:, : c["intermediate_size"]], gu[:, c["intermediate_size"] :]
-            x = x + ((g / (1 + np.exp(-g))) * u) @ L["down"].T
-        return self.rms(x, self.norm) @ self.embed.T
+            x = x + ((g / (1 + np.exp(-g))) * u) @ self.lin(f"{p}.mlp.down_proj").T
+        self.pos = total
+        last = self.rms(x[-1:], self.vec("model.norm.weight"))
+        # The tied LM head, in vocabulary chunks to bound memory.
+        qw, qs = self.t["model.embed_tokens.q_weight"], self.t["model.embed_tokens.q_scale"]
+        return np.concatenate(
+            [(last @ dequantize(qw[r : r + 16384], qs[r : r + 16384]).T)[0] for r in range(0, qw.shape[0], 16384)]
+        )
 
 
 def main() -> None:
@@ -120,13 +137,14 @@ def main() -> None:
     prompt = tok.encode(text).ids
     model = Model(args.model_dir)
 
-    tokens = list(prompt)
     step_logits = []
+    generated: list[int] = []
+    step = list(prompt)
     for _ in range(args.steps):
-        logits = model.forward(tokens)[-1]
+        logits = model.forward(step)
         step_logits.append(logits)
-        tokens.append(int(np.argmax(logits)))
-    generated = tokens[len(prompt) :]
+        generated.append(int(np.argmax(logits)))
+        step = [generated[-1]]
     print(json.dumps({"prompt_tokens": prompt, "generated": generated}))
     print(repr(tok.decode(generated)))
     if args.out_dir:

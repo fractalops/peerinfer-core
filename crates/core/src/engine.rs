@@ -5,7 +5,7 @@ use std::{collections::HashMap, ops::Range};
 use anyhow::{Context, Result, ensure};
 use wgpu::util::DeviceExt;
 
-use crate::model::{Config, DType, Weights};
+use crate::model::{Arch, Config, DType, Weights};
 
 /// Largest context the attention kernel supports.
 pub const MAX_CONTEXT: usize = 2048;
@@ -187,7 +187,19 @@ impl Engine {
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("peerinfer"),
                 required_features: optional,
-                required_limits: wgpu::Limits::default(),
+                required_limits: wgpu::Limits {
+                    // Large embeddings, like Qwen3 4B's 194 MB, need more
+                    // than the 128 MiB default when the GPU allows it.
+                    max_storage_buffer_binding_size: adapter
+                        .limits()
+                        .max_storage_buffer_binding_size
+                        .max(wgpu::Limits::default().max_storage_buffer_binding_size),
+                    max_buffer_size: adapter
+                        .limits()
+                        .max_buffer_size
+                        .max(wgpu::Limits::default().max_buffer_size),
+                    ..wgpu::Limits::default()
+                },
                 ..Default::default()
             })
             .await
@@ -239,7 +251,11 @@ impl Engine {
         let last = layers.end == weights.config.num_hidden_layers;
         let device_has_timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let c = weights.config.clone();
-        ensure!(c.head_dim == 64, "head size {} is not 64", c.head_dim);
+        ensure!(
+            c.head_dim == 64 || c.head_dim == 128,
+            "head size {} is not 64 or 128",
+            c.head_dim
+        );
         let (h, inter, qkv_dim) = (c.hidden_size, c.intermediate_size, c.qkv_dim());
 
         let storage = |label: &str, bytes: usize| {
@@ -326,6 +342,8 @@ impl Engine {
             ("HKV", hkv),
             ("D", d),
             ("BASE", c.position_embedding_base as f64),
+            ("QKNORM", if c.arch == Arch::Qwen3 { 1.0 } else { 0.0 }),
+            ("EPS", c.rms_norm_eps as f64),
         ];
         let norm_consts = [("K", h as f64), ("EPS", c.rms_norm_eps as f64)];
 
@@ -354,7 +372,25 @@ impl Engine {
                 DType::F16,
                 &[h],
             )?;
-            let (wqkv, sqkv) = linear(&format!("{p}.self_attn.qkv_proj"), qkv_dim, h)?;
+            let (wqkv, sqkv) = linear(&format!("{p}.self_attn.{}", c.qkv_name()), qkv_dim, h)?;
+            // Qwen3 normalizes each query and key head; other models bind a
+            // placeholder that the kernel does not read.
+            let (qn, kn) = if c.arch == Arch::Qwen3 {
+                (
+                    upload(
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        DType::F16,
+                        &[c.head_dim],
+                    )?,
+                    upload(
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        DType::F16,
+                        &[c.head_dim],
+                    )?,
+                )
+            } else {
+                (ln1.clone(), ln1.clone())
+            };
             let (wo, so) = linear(&format!("{p}.self_attn.o_proj"), h, c.q_dim())?;
             let (wgu, sgu) = linear(&format!("{p}.mlp.gate_up_proj"), 2 * inter, h)?;
             let (wd, sd) = linear(&format!("{p}.mlp.down_proj"), h, inter)?;
@@ -386,7 +422,7 @@ impl Engine {
                 &device,
                 "rope_kv",
                 &rope_consts,
-                &[&qkv, &kc, &vc, &step],
+                &[&qkv, &kc, &vc, &step, &qn, &kn],
                 heads,
                 None,
             )?);

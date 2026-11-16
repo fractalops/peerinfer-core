@@ -4,15 +4,17 @@ import { defineConfig } from "vite";
 
 // Serves ../fixtures at /fixtures/ so the bench page can load local weights.
 export default defineConfig({
-  // The ONNX Runtime baseline imports the product's runtime code from the
-  // peerinfer checkout next to this one.
-  server: { watch: null, fs: { allow: ["..", "../../peerinfer"] } },
+  server: { watch: null },
   plugins: [
     {
       name: "fixtures",
       configureServer(server) {
         server.middlewares.use("/fixtures/", (req, res, next) => {
-          const path = decodeURIComponent((req.url ?? "").split("?")[0]);
+          // WebLLM asks for Hugging Face style paths: <model>/resolve/main/<file>.
+          const path = decodeURIComponent((req.url ?? "").split("?")[0]).replace(
+            "/resolve/main/",
+            "/",
+          );
           if (path.includes("..")) return next();
           const file = fileURLToPath(new URL(`../fixtures${path}`, import.meta.url));
           try {

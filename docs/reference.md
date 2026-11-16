@@ -2,10 +2,11 @@
 
 ## Supported models
 
-- Architecture: Llama-style decoder models with grouped-query attention, rotary position embedding (rotate-half) and SwiGLU. `model_type` must be `llama`.
+- Architectures: Llama-style decoder models with grouped-query attention, rotary position embedding (rotate-half) and SwiGLU, with `model_type` `llama`; and Qwen3 (`model_type` `qwen3`), which also RMS-normalizes each query and key head before the rotary embedding.
 - Weights: MLC `q4f16_1` (`mlc-chat-config.json`, `ndarray-cache.json` and `params_shard_*.bin`). Each linear layer has `q_weight` (u32, 8 values each, low bits first) and `q_scale` (f16, one per group of 32). A value is `(q - 7) * scale`.
 - Tied embeddings only: the token embedding is also the output layer.
-- Head size 64.
+- Head size 64 or 128.
+- Tensors larger than 128 MiB, such as Qwen3 4B's embedding, need a GPU that allows larger storage buffers. The engine requests the adapter's limits.
 - Context: up to 2,048 tokens. A forward pass takes up to 256 tokens; longer prompts run in parts.
 
 ## Library
