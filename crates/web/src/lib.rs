@@ -53,6 +53,35 @@ impl Engine {
         Ok(out)
     }
 
+    /// Generates up to `max` tokens after the token returned by the last
+    /// `forward` call. Calls `on_tokens` with each batch as a Uint32Array.
+    /// Generation stops when it returns false.
+    #[wasm_bindgen(js_name = generateStream)]
+    pub async fn generate_stream(
+        &mut self,
+        max: usize,
+        on_tokens: js_sys::Function,
+    ) -> Result<(), JsError> {
+        let mut error = None;
+        self.0
+            .generate(max, |t| {
+                let batch = js_sys::Uint32Array::from(t);
+                match on_tokens.call1(&JsValue::NULL, &batch) {
+                    Ok(v) => v.as_bool().unwrap_or(false),
+                    Err(e) => {
+                        error = Some(e);
+                        false
+                    }
+                }
+            })
+            .await
+            .map_err(js_err)?;
+        match error {
+            Some(e) => Err(JsError::new(&format!("{e:?}"))),
+            None => Ok(()),
+        }
+    }
+
     /// Sets random sampling. A temperature of 0 selects greedy decoding.
     #[wasm_bindgen(js_name = setSampling)]
     pub fn set_sampling(&mut self, temperature: f32, top_p: f32, seed: u32) -> Result<(), JsError> {
