@@ -1,0 +1,107 @@
+import init, { Engine } from "./wasm/peerinfer_core_web.js";
+
+const MODEL = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+const DIR = "/fixtures/smollm2-360m-q4f16_1/";
+const params = new URLSearchParams(location.search);
+const PROMPT = Number(params.get("prompt") ?? 128);
+const GEN = Number(params.get("gen") ?? 128);
+const RUNS = Number(params.get("runs") ?? 5);
+
+const log = (s) => {
+  document.querySelector("#log").textContent += s + "\n";
+  console.log(s);
+};
+const median = (v) => [...v].sort((a, b) => a - b)[Math.floor(v.length / 2)];
+
+async function runOurs() {
+  const t0 = performance.now();
+  await init();
+  const text = (f) => fetch(DIR + f).then((r) => r.text());
+  const [chat, cache] = await Promise.all([text("mlc-chat-config.json"), text("ndarray-cache.json")]);
+  const shards = await Promise.all(
+    JSON.parse(cache).records.map((s) =>
+      fetch(DIR + s.dataPath).then(async (r) => new Uint8Array(await r.arrayBuffer())),
+    ),
+  );
+  const engine = await Engine.load(chat, cache, shards);
+  const load = (performance.now() - t0) / 1000;
+  log(`peerinfer-core on ${engine.adapter()}: load ${load.toFixed(2)} s`);
+  const prompt = Array.from({ length: PROMPT }, (_, i) => 1000 + ((i * 37) % 20000));
+  const prefill = [];
+  const decode = [];
+  for (let run = 0; run <= RUNS; run++) {
+    engine.reset();
+    const a = performance.now();
+    let next = await engine.forward(Uint32Array.from(prompt));
+    const b = performance.now();
+    for (let i = 0; i < GEN; i++) next = await engine.forward(Uint32Array.of(next));
+    const c = performance.now();
+    if (run === 0) continue;
+    prefill.push(PROMPT / ((b - a) / 1000));
+    decode.push(GEN / ((c - b) / 1000));
+  }
+  return { engine: "peerinfer-core", load, prefill: median(prefill), decode: median(decode) };
+}
+
+async function runWebLLM() {
+  const webllm = await import("@mlc-ai/web-llm");
+  const t0 = performance.now();
+  const engine = await webllm.CreateMLCEngine(MODEL);
+  const load = (performance.now() - t0) / 1000;
+  log(`WebLLM: load ${load.toFixed(2)} s (includes download on first run)`);
+  // About PROMPT tokens including the chat template.
+  const words = Array.from({ length: PROMPT - 12 }, (_, i) => ["river", "stone", "light", "paper"][i % 4]).join(" ");
+  const prefill = [];
+  const decode = [];
+  let promptTokens = 0;
+  const reported = [];
+  for (let run = 0; run <= RUNS; run++) {
+    await engine.resetChat();
+    // Wall-clock timing from the stream, measured the same way as ours:
+    // prefill ends at the first token, decode covers the remaining tokens.
+    const start = performance.now();
+    let first = 0;
+    let usage;
+    const stream = await engine.chat.completions.create({
+      messages: [{ role: "user", content: words }],
+      max_tokens: GEN,
+      temperature: 0,
+      ignore_eos: true,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+    for await (const chunk of stream) {
+      if (!first && chunk.choices?.[0]?.delta?.content) first = performance.now();
+      if (chunk.usage) usage = chunk.usage;
+    }
+    const end = performance.now();
+    if (run === 0) continue;
+    promptTokens = usage.prompt_tokens;
+    prefill.push(usage.prompt_tokens / ((first - start) / 1000));
+    decode.push((usage.completion_tokens - 1) / ((end - first) / 1000));
+    reported.push(usage.extra.decode_tokens_per_s);
+  }
+  return {
+    engine: "WebLLM 0.2.88",
+    load,
+    promptTokens,
+    prefill: median(prefill),
+    decode: median(decode),
+    decodeReported: median(reported),
+  };
+}
+
+async function bench(fn) {
+  try {
+    const r = await fn();
+    log(JSON.stringify(r));
+    (window.results ??= []).push(r);
+  } catch (e) {
+    log(`error: ${e?.message ?? e}`);
+    (window.results ??= []).push({ error: String(e?.message ?? e) });
+  }
+}
+
+document.querySelector("#ours").onclick = () => bench(runOurs);
+document.querySelector("#webllm").onclick = () => bench(runWebLLM);
+window.bench = { ours: () => bench(runOurs), webllm: () => bench(runWebLLM) };

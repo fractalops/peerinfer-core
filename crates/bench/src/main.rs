@@ -22,6 +22,7 @@ fn main() -> Result<()> {
             };
             pollster::block_on(speed(args[1].as_ref(), n(2, 128)?, n(3, 128)?, n(4, 5)?))
         }
+        Some("profile") if args.len() == 2 => pollster::block_on(profile(args[1].as_ref())),
         _ => bail!(
             "usage: peerinfer-bench check MODEL_DIR REF_DIR | speed MODEL_DIR [PROMPT] [GEN] [RUNS]"
         ),
@@ -91,6 +92,17 @@ async fn check(model: &std::path::Path, reference: &std::path::Path) -> Result<(
         generated.len(),
         100.0 * worst
     );
+    engine.reset();
+    let first = engine.forward(&prompt).await?;
+    let mut fast = vec![first];
+    engine
+        .generate(generated.len() - 1, |t| {
+            fast.extend_from_slice(t);
+            true
+        })
+        .await?;
+    println!("generate matches the reference: {}", fast == generated);
+    ensure!(fast == generated, "generate returned {fast:?}");
     ensure!(
         agree == generated.len(),
         "top-1 tokens differ from the reference"
@@ -116,11 +128,16 @@ async fn speed(
     for run in 0..=runs {
         engine.reset();
         let t0 = Instant::now();
-        let mut next = engine.forward(&prompt).await?;
+        engine.forward(&prompt).await?;
         let t1 = Instant::now();
-        for _ in 0..gen_len {
-            next = engine.forward(&[next]).await?;
-        }
+        let mut produced = 0;
+        engine
+            .generate(gen_len, |t| {
+                produced += t.len();
+                true
+            })
+            .await?;
+        ensure!(produced == gen_len, "generated {produced} tokens");
         let t2 = Instant::now();
         if run == 0 {
             continue; // warm-up
@@ -137,5 +154,23 @@ async fn speed(
         median(&mut prefill),
         median(&mut decode)
     );
+    Ok(())
+}
+
+async fn profile(model: &std::path::Path) -> Result<()> {
+    let (mut engine, _) = load(model).await?;
+    let prompt: Vec<u32> = (0..128u32).map(|i| 1000 + (i * 37) % 20000).collect();
+    let next = engine.forward(&prompt).await?;
+    engine.profile(next).await?; // warm-up
+    let mut rows = engine.profile(next).await?;
+    if rows.is_empty() {
+        bail!("this GPU does not support timestamp queries");
+    }
+    let total: f64 = rows.iter().map(|r| r.1).sum();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+    for (name, ms) in rows {
+        println!("{ms:7.3} ms {:5.1}%  {name}", 100.0 * ms / total);
+    }
+    println!("{total:7.3} ms total GPU time for one decode step at position 128");
     Ok(())
 }

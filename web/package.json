@@ -1,0 +1,14 @@
+{
+  "name": "peerinfer-core-bench",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5190"
+  },
+  "dependencies": {
+    "@mlc-ai/web-llm": "0.2.88"
+  },
+  "devDependencies": {
+    "vite": "8.3.8"
+  }
+}

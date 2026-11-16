@@ -1,3 +1,7 @@
 /target
 /fixtures
 *.npz
+/web/node_modules
+/web/src/wasm
+/web/dist
+/.playwright-cli
