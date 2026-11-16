@@ -4,7 +4,9 @@ import { defineConfig } from "vite";
 
 // Serves ../fixtures at /fixtures/ so the bench page can load local weights.
 export default defineConfig({
-  server: { watch: null },
+  // The ONNX Runtime baseline imports the product's runtime code from the
+  // peerinfer checkout next to this one.
+  server: { watch: null, fs: { allow: ["..", "../../peerinfer"] } },
   plugins: [
     {
       name: "fixtures",
