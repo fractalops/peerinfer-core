@@ -3,10 +3,14 @@
 // 32 weights (4 words, one scale) at a time.
 // MODE 0 stores, MODE 1 adds to y (residual), MODE 2 applies SwiGLU:
 // y[t, n] = silu(row n) * (row n + N).
+// With NORM, x is first RMS-normalized with gain g; this replaces a
+// separate RMSNorm dispatch. Without NORM, g is not read.
 
 override N: u32;
 override K: u32;
 override MODE: u32 = 0u;
+override NORM: bool = false;
+override EPS: f32 = 0.0;
 
 const LANES: u32 = 8u;
 const ROWS: u32 = 32u;
@@ -16,6 +20,7 @@ const MAX_WORDS: u32 = 320u; // K <= 2560
 @group(0) @binding(1) var<storage, read> w: array<vec4<u32>>;
 @group(0) @binding(2) var<storage, read> s: array<u32>;
 @group(0) @binding(3) var<storage, read_write> y: array<f32>;
+@group(0) @binding(4) var<storage, read> g: array<u32>;
 
 // For word i: x values 8i+0,2,4,6 and 8i+1,3,5,7, and their sum.
 var<workgroup> xe: array<vec4<f32>, MAX_WORDS>;
@@ -54,10 +59,36 @@ fn dot_row(row: u32, lane: u32) -> f32 {
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
     let t = wg.y;
     let words = K / 8u;
+    var inv = 1.0;
+    if (NORM) {
+        var ss = 0.0;
+        for (var i = li; i < K; i += 256u) {
+            let v = x[t * K + i];
+            ss += v * v;
+        }
+        red[li] = ss;
+        workgroupBarrier();
+        for (var st = 128u; st > 0u; st >>= 1u) {
+            if (li < st) {
+                red[li] += red[li + st];
+            }
+            workgroupBarrier();
+        }
+        inv = inverseSqrt(red[0] / f32(K) + EPS);
+        workgroupBarrier();
+    }
     for (var i = li; i < words; i += 256u) {
         let b = t * K + i * 8u;
-        let e = vec4(x[b], x[b + 2u], x[b + 4u], x[b + 6u]);
-        let o = vec4(x[b + 1u], x[b + 3u], x[b + 5u], x[b + 7u]);
+        var e = vec4(x[b], x[b + 2u], x[b + 4u], x[b + 6u]);
+        var o = vec4(x[b + 1u], x[b + 3u], x[b + 5u], x[b + 7u]);
+        if (NORM) {
+            let p0 = unpack2x16float(g[4u * i]);
+            let p1 = unpack2x16float(g[4u * i + 1u]);
+            let p2 = unpack2x16float(g[4u * i + 2u]);
+            let p3 = unpack2x16float(g[4u * i + 3u]);
+            e *= inv * vec4(p0.x, p1.x, p2.x, p3.x);
+            o *= inv * vec4(p0.y, p1.y, p2.y, p3.y);
+        }
         xe[i] = e;
         xo[i] = o;
         xsum[i] = dot(e, vec4(1.0)) + dot(o, vec4(1.0));

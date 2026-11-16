@@ -54,10 +54,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
     var m = -3.4e38;
     for (var j = i; j < len; j += 256u) {
         let kb = (j * kvd + kh * D) / 4u;
+        // Unrolled by hand (see matmul_tiled.wgsl).
         var d = 0.0;
-        for (var e = 0u; e < 16u; e++) {
-            d += dot(q[e], kc[kb + e]);
-        }
+        d += dot(q[0], kc[kb + 0u]) + dot(q[1], kc[kb + 1u]) + dot(q[2], kc[kb + 2u]) + dot(q[3], kc[kb + 3u]);
+        d += dot(q[4], kc[kb + 4u]) + dot(q[5], kc[kb + 5u]) + dot(q[6], kc[kb + 6u]) + dot(q[7], kc[kb + 7u]);
+        d += dot(q[8], kc[kb + 8u]) + dot(q[9], kc[kb + 9u]) + dot(q[10], kc[kb + 10u]) + dot(q[11], kc[kb + 11u]);
+        d += dot(q[12], kc[kb + 12u]) + dot(q[13], kc[kb + 13u]) + dot(q[14], kc[kb + 14u]) + dot(q[15], kc[kb + 15u]);
         d *= inv;
         sc[j] = d;
         m = max(m, d);
@@ -75,11 +77,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) i
     // Thread i sums dimension i % 64 over positions j = slice, slice + 4, ...
     let dim = i % D;
     let slice = i / D;
-    var acc = 0.0;
-    for (var j = slice; j < len; j += SLICES) {
-        acc += sc[j] * vc[j * kvd + kh * D + dim];
+    // Four independent sums per thread; unrolled by hand.
+    var acc = vec4<f32>();
+    let vb = kh * D + dim;
+    var j = slice;
+    for (; j + 3u * SLICES < len; j += 4u * SLICES) {
+        acc += vec4(
+            sc[j] * vc[j * kvd + vb],
+            sc[j + SLICES] * vc[(j + SLICES) * kvd + vb],
+            sc[j + 2u * SLICES] * vc[(j + 2u * SLICES) * kvd + vb],
+            sc[j + 3u * SLICES] * vc[(j + 3u * SLICES) * kvd + vb],
+        );
     }
-    red[i] = acc;
+    for (; j < len; j += SLICES) {
+        acc.x += sc[j] * vc[j * kvd + vb];
+    }
+    red[i] = acc.x + acc.y + acc.z + acc.w;
     workgroupBarrier();
     if (slice == 0u) {
         let a = red[dim] + red[dim + 64u] + red[dim + 128u] + red[dim + 192u];

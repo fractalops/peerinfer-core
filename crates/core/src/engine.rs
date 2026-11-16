@@ -48,6 +48,9 @@ fn k_splits(n: usize, k: usize) -> usize {
 
 impl Pass {
     fn dispatch(&self, cp: &mut wgpu::ComputePass<'_>, n: usize) {
+        if self.tiled_only && n < TILED_MIN_TOKENS {
+            return;
+        }
         match &self.tiled {
             Some(t) if n >= TILED_MIN_TOKENS => {
                 cp.set_pipeline(&t.pipeline);
@@ -73,6 +76,9 @@ const TILE: u32 = 32;
 struct Pass {
     name: String,
     tiled: Option<Tiled>,
+    /// Runs only in passes that use the tiled matmul (RMSNorm, which the
+    /// one-token matmul does itself).
+    tiled_only: bool,
     pipeline: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
     /// Workgroups in x; y is the token count unless `fixed_y` is set.
@@ -275,6 +281,7 @@ impl Engine {
                 1,
                 None,
             )?);
+            passes.last_mut().unwrap().tiled_only = true;
             passes.push(kernels.matmul(
                 &device,
                 qkv_dim,
@@ -283,6 +290,7 @@ impl Engine {
                 [&xn, &wqkv, &sqkv, &qkv],
                 &step,
                 &part,
+                Some((&x, &ln1, c.rms_norm_eps)),
                 None,
             )?);
             passes.push(kernels.pass(
@@ -310,6 +318,7 @@ impl Engine {
                 &step,
                 &part,
                 None,
+                None,
             )?);
             passes.push(kernels.pass(
                 &device,
@@ -319,6 +328,7 @@ impl Engine {
                 1,
                 None,
             )?);
+            passes.last_mut().unwrap().tiled_only = true;
             passes.push(kernels.matmul(
                 &device,
                 inter,
@@ -327,6 +337,7 @@ impl Engine {
                 [&xn, &wgu, &sgu, &act],
                 &step,
                 &part,
+                Some((&x, &ln2, c.rms_norm_eps)),
                 None,
             )?);
             passes.push(kernels.matmul(
@@ -337,6 +348,7 @@ impl Engine {
                 [&act, &wd, &sd, &x],
                 &step,
                 &part,
+                None,
                 None,
             )?);
         }
@@ -364,6 +376,7 @@ impl Engine {
                 [&last, &embed_w, &embed_s, &logits],
                 &step,
                 &part,
+                None,
                 Some(1),
             )?,
             kernels.pass(
@@ -746,6 +759,7 @@ impl Kernels {
         Ok(Pass {
             name,
             tiled: None,
+            tiled_only: false,
             pipeline,
             bind,
             groups_x,
@@ -766,14 +780,21 @@ impl Kernels {
         bufs: [&wgpu::Buffer; 4],
         step: &wgpu::Buffer,
         part: &wgpu::Buffer,
+        norm: Option<(&wgpu::Buffer, &wgpu::Buffer, f32)>,
         fixed_y: Option<u32>,
     ) -> Result<Pass> {
         let consts = [("N", n as f64), ("K", k as f64), ("MODE", mode as f64)];
+        // The one-token kernel normalizes the raw input itself when asked.
+        let (one_x, gain, norm_consts) = match norm {
+            Some((raw, gain, eps)) => (raw, gain, [("NORM", 1.0), ("EPS", eps as f64)]),
+            None => (bufs[0], bufs[1], [("NORM", 0.0), ("EPS", 0.0)]),
+        };
+        let one_consts: Vec<(&str, f64)> = consts.iter().chain(&norm_consts).copied().collect();
         let mut pass = self.pass(
             device,
             "matmul",
-            &consts,
-            &bufs,
+            &one_consts,
+            &[one_x, bufs[1], bufs[2], bufs[3], gain],
             (n as u32).div_ceil(ROWS_PER_WORKGROUP),
             fixed_y,
         )?;
