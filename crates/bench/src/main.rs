@@ -6,7 +6,7 @@
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail, ensure};
-use peerinfer_core::{Engine, Sampling, Weights, philox};
+use peerinfer_core::{Engine, Input, Output, Sampling, Weights, philox};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -37,6 +37,9 @@ fn main() -> Result<()> {
                 n(3, 128)?,
                 n(4, 5)?,
             ))
+        }
+        Some("split-check") if args.len() == 4 => {
+            pollster::block_on(split_check(args[1].as_ref(), args[2].as_ref(), &args[3]))
         }
         Some("profile") if args.len() >= 2 => {
             let n = args
@@ -337,5 +340,128 @@ async fn speed_sample(
         "decode with temperature 0.7, top-p 0.9: {:.1} tok/s ({gen_len} tokens, median of {runs})",
         decode[decode.len() / 2]
     );
+    Ok(())
+}
+
+/// Runs the model whole and split into stages at the layer numbers in
+/// `cuts` (for example "15" or "10,20") and requires the same logits and
+/// tokens at every step, greedy and with sampling.
+async fn split_check(
+    model: &std::path::Path,
+    reference: &std::path::Path,
+    cuts: &str,
+) -> Result<()> {
+    let tokens: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reference.join("tokens.json"))?)?;
+    let ids = |k: &str| -> Vec<u32> {
+        tokens[k]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_u64().unwrap() as u32)
+            .collect()
+    };
+    let (prompt, generated) = (ids("prompt"), ids("generated"));
+    let all = Weights::read_dir(model)?;
+    let total = all.config.num_hidden_layers;
+    let mut bounds = vec![0];
+    for c in cuts.split(',') {
+        bounds.push(c.trim().parse::<usize>().context("bad cut")?);
+    }
+    bounds.push(total);
+    ensure!(
+        bounds.windows(2).all(|w| w[0] < w[1]),
+        "cuts must increase within 1..{total}"
+    );
+
+    let mut whole = Engine::new(&all).await?;
+    let mut stages = Vec::new();
+    let all_bytes: usize = all.shards.iter().map(Vec::len).sum();
+    for w in bounds.windows(2) {
+        let weights = Weights::read_dir_stage(model, Some(w[0]..w[1]))?;
+        let loaded = weights.shards.iter().filter(|s| !s.is_empty()).count();
+        let bytes: usize = weights.shards.iter().map(Vec::len).sum();
+        println!(
+            "stage layers {:2}..{:2}: {loaded}/{} shards, {:.1} of {:.1} MB",
+            w[0],
+            w[1],
+            weights.shards.len(),
+            bytes as f64 / 1e6,
+            all_bytes as f64 / 1e6
+        );
+        stages.push(Engine::new_stage(&weights, w[0]..w[1]).await?);
+    }
+
+    async fn chain(stages: &mut [Engine], tokens: &[u32]) -> Result<(u32, usize)> {
+        let mut out = stages[0].run(Input::Tokens(tokens)).await?;
+        let mut sent = 0;
+        for s in &mut stages[1..] {
+            let Output::Hidden(h) = out else {
+                bail!("a middle stage returned a token")
+            };
+            sent += h.len() * 4;
+            out = s.run(Input::Hidden(&h)).await?;
+        }
+        match out {
+            Output::Token(t) => Ok((t, sent)),
+            Output::Hidden(_) => bail!("the last stage returned hidden states"),
+        }
+    }
+
+    // Greedy, teacher-forced with the reference tokens.
+    let mut worst = 0f32;
+    let mut input = prompt.clone();
+    for (step, &expected) in generated.iter().enumerate() {
+        let a = whole.forward(&input).await?;
+        let (b, sent) = chain(&mut stages, &input).await?;
+        let la = whole.last_logits().await?;
+        let lb = stages.last().unwrap().last_logits().await?;
+        let diff = la
+            .iter()
+            .zip(&lb)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max);
+        worst = worst.max(diff);
+        ensure!(
+            a == b,
+            "step {step}: whole model picked {a}, stages picked {b}"
+        );
+        if step < 2 {
+            println!(
+                "step {step}: {} tokens in, {sent} bytes between stages",
+                input.len()
+            );
+        }
+        input = vec![expected];
+    }
+    println!(
+        "greedy: same tokens for {} steps, largest logit difference {worst}",
+        generated.len()
+    );
+
+    // Sampling: the last stage and the whole model use the same seed.
+    let sampling = Some(Sampling {
+        temperature: 0.8,
+        top_p: 0.9,
+        seed: 42,
+    });
+    whole.set_sampling(sampling)?;
+    stages.last_mut().unwrap().set_sampling(sampling)?;
+    whole.reset();
+    for s in &mut stages {
+        s.reset();
+    }
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let (mut ia, mut ib) = (prompt.clone(), prompt.clone());
+    for _ in 0..24 {
+        let ta = whole.forward(&ia).await?;
+        let (tb, _) = chain(&mut stages, &ib).await?;
+        a.push(ta);
+        b.push(tb);
+        ia = vec![ta];
+        ib = vec![tb];
+    }
+    println!("sampling: same 24 tokens: {}", a == b);
+    ensure!(a == b, "sampled tokens differ: {a:?} vs {b:?}");
     Ok(())
 }

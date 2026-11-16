@@ -1,6 +1,6 @@
 //! Llama forward pass on wgpu.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use anyhow::{Context, Result, ensure};
 use wgpu::util::DeviceExt;
@@ -121,7 +121,7 @@ pub struct Engine {
     logits_read: wgpu::Buffer,
     passes: Vec<Pass>,
     head: Vec<Pass>,
-    sample: Pass,
+    sample: Option<Pass>,
     sampling: Option<Sampling>,
     params: wgpu::Buffer,
     sample_read: wgpu::Buffer,
@@ -129,11 +129,49 @@ pub struct Engine {
     pos: usize,
     adapter_info: wgpu::AdapterInfo,
     timestamps: bool,
+    layers: Range<usize>,
+    /// Residual stream; a stage that is not first writes its input here.
+    x: wgpu::Buffer,
+    /// Residual stream read back by a stage that is not last.
+    hidden_read: wgpu::Buffer,
+}
+
+/// Input of one forward pass.
+pub enum Input<'a> {
+    /// Token IDs, for a stage that starts at layer 0.
+    Tokens(&'a [u32]),
+    /// Hidden states, `n * hidden_size` values for n tokens, for a later stage.
+    Hidden(&'a [f32]),
+}
+
+/// Output of one forward pass.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Output {
+    /// The next token, from a stage that ends at the last layer.
+    Token(u32),
+    /// Hidden states after this stage's layers, `n * hidden_size` values.
+    Hidden(Vec<f32>),
 }
 
 impl Engine {
-    /// Requests a GPU device and uploads the weights.
+    /// Requests a GPU device and uploads the weights of the whole model.
     pub async fn new(weights: &Weights) -> Result<Self> {
+        let layers = 0..weights.config.num_hidden_layers;
+        Self::new_stage(weights, layers).await
+    }
+
+    /// Requests a GPU device and uploads the weights for `layers` only.
+    ///
+    /// A stage that starts at layer 0 embeds tokens. A stage that ends at the
+    /// last layer applies the final norm and the LM head and picks the token.
+    /// Other stages take and return hidden states. Both end stages load the
+    /// token embedding, which is also the LM head.
+    pub async fn new_stage(weights: &Weights, layers: Range<usize>) -> Result<Self> {
+        let n = weights.config.num_hidden_layers;
+        ensure!(
+            layers.start < layers.end && layers.end <= n,
+            "layers {layers:?} are not a range within 0..{n}"
+        );
         let instance =
             wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let adapter = instance
@@ -154,7 +192,22 @@ impl Engine {
             })
             .await
             .context("request GPU device")?;
-        Self::with_device(device, queue, adapter_info, weights)
+        Self::with_device(device, queue, adapter_info, weights, layers)
+    }
+
+    /// The layers this engine runs.
+    pub fn layers(&self) -> Range<usize> {
+        self.layers.clone()
+    }
+
+    /// True when this stage starts at layer 0 and takes tokens.
+    pub fn is_first(&self) -> bool {
+        self.layers.start == 0
+    }
+
+    /// True when this stage ends at the last layer and returns tokens.
+    pub fn is_last(&self) -> bool {
+        self.layers.end == self.config.num_hidden_layers
     }
 
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
@@ -180,7 +233,10 @@ impl Engine {
         queue: wgpu::Queue,
         adapter_info: wgpu::AdapterInfo,
         weights: &Weights,
+        layers: Range<usize>,
     ) -> Result<Self> {
+        let first = layers.start == 0;
+        let last = layers.end == weights.config.num_hidden_layers;
         let device_has_timestamps = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let c = weights.config.clone();
         ensure!(c.head_dim == 64, "head size {} is not 64", c.head_dim);
@@ -221,7 +277,7 @@ impl Engine {
         let qkv = storage("qkv", MAX_CHUNK * qkv_dim * f);
         let attn = storage("attn", MAX_CHUNK * c.q_dim() * f);
         let act = storage("act", MAX_CHUNK * inter * f);
-        let last = storage("last", h * f);
+        let last_row = storage("last", h * f);
         let logits = storage("logits", c.vocab_size * f);
         // Token at each position, written by argmax.
         let history = storage("history", (MAX_CONTEXT + 1) * 4);
@@ -258,6 +314,7 @@ impl Engine {
             read("history_read_1", GENERATE_BATCH * 4),
         ];
         let logits_read = read("logits_read", c.vocab_size * f);
+        let hidden_read = read("hidden_read", MAX_CHUNK * h * f);
 
         let mut kernels = Kernels::new(&device);
         let hq = c.num_attention_heads as f64;
@@ -272,17 +329,24 @@ impl Engine {
         ];
         let norm_consts = [("K", h as f64), ("EPS", c.rms_norm_eps as f64)];
 
-        let (embed_w, embed_s) = linear("model.embed_tokens", c.vocab_size, h)?;
-        let mut passes = vec![kernels.pass(
-            &device,
-            "embed",
-            &[("K", h as f64)],
-            &[&tokens, &embed_w, &embed_s, &x],
-            ((h / 8) as u32).div_ceil(64),
-            None,
-        )?];
+        let embed = if first || last {
+            Some(linear("model.embed_tokens", c.vocab_size, h)?)
+        } else {
+            None
+        };
+        let mut passes = Vec::new();
+        if let (true, Some((embed_w, embed_s))) = (first, &embed) {
+            passes.push(kernels.pass(
+                &device,
+                "embed",
+                &[("K", h as f64)],
+                &[&tokens, embed_w, embed_s, &x],
+                ((h / 8) as u32).div_ceil(64),
+                None,
+            )?);
+        }
 
-        for l in 0..c.num_hidden_layers {
+        for l in layers.clone() {
             let p = format!("model.layers.{l}");
             let ln1 = upload(&format!("{p}.input_layernorm.weight"), DType::F16, &[h])?;
             let ln2 = upload(
@@ -378,13 +442,6 @@ impl Engine {
             )?);
         }
 
-        let norm = upload("model.norm.weight", DType::F16, &[h])?;
-        let last_norm = [
-            ("K", h as f64),
-            ("EPS", c.rms_norm_eps as f64),
-            ("LAST", 1.0),
-        ];
-        let probs = storage("probs", c.vocab_size * f);
         let params = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("sample params"),
             size: std::mem::size_of::<SampleParams>() as u64,
@@ -392,43 +449,55 @@ impl Engine {
             mapped_at_creation: false,
         });
         let sample_read = read("sample_read", 8);
-        let sample = kernels.pass(
-            &device,
-            "sample",
-            &[("V", c.vocab_size as f64)],
-            &[&logits, &probs, &tokens, &history, &step, &params],
-            1,
-            Some(1),
-        )?;
-        let head = vec![
-            kernels.pass(
+        let (head, sample) = if let (true, Some((embed_w, embed_s))) = (last, &embed) {
+            let norm = upload("model.norm.weight", DType::F16, &[h])?;
+            let last_norm = [
+                ("K", h as f64),
+                ("EPS", c.rms_norm_eps as f64),
+                ("LAST", 1.0),
+            ];
+            let probs = storage("probs", c.vocab_size * f);
+            let sample = kernels.pass(
                 &device,
-                "rmsnorm",
-                &last_norm,
-                &[&x, &norm, &last, &step],
-                1,
-                Some(1),
-            )?,
-            kernels.matmul(
-                &device,
-                c.vocab_size,
-                h,
-                0,
-                [&last, &embed_w, &embed_s, &logits],
-                &step,
-                &part,
-                None,
-                Some(1),
-            )?,
-            kernels.pass(
-                &device,
-                "argmax",
+                "sample",
                 &[("V", c.vocab_size as f64)],
-                &[&logits, &tokens, &history, &step],
+                &[&logits, &probs, &tokens, &history, &step, &params],
                 1,
                 Some(1),
-            )?,
-        ];
+            )?;
+            let head = vec![
+                kernels.pass(
+                    &device,
+                    "rmsnorm",
+                    &last_norm,
+                    &[&x, &norm, &last_row, &step],
+                    1,
+                    Some(1),
+                )?,
+                kernels.matmul(
+                    &device,
+                    c.vocab_size,
+                    h,
+                    0,
+                    [&last_row, embed_w, embed_s, &logits],
+                    &step,
+                    &part,
+                    None,
+                    Some(1),
+                )?,
+                kernels.pass(
+                    &device,
+                    "argmax",
+                    &[("V", c.vocab_size as f64)],
+                    &[&logits, &tokens, &history, &step],
+                    1,
+                    Some(1),
+                )?,
+            ];
+            (head, Some(sample))
+        } else {
+            (Vec::new(), None)
+        };
 
         Ok(Self {
             device,
@@ -450,41 +519,105 @@ impl Engine {
             pos: 0,
             adapter_info,
             timestamps: device_has_timestamps,
+            layers,
+            x,
+            hidden_read,
         })
     }
 
-    /// Appends `tokens` to the context and returns the most likely next token.
+    /// Appends `tokens` to the context and returns the next token. Needs a
+    /// stage that starts at layer 0 and ends at the last layer.
     pub async fn forward(&mut self, tokens: &[u32]) -> Result<u32> {
-        ensure!(!tokens.is_empty(), "no tokens");
+        ensure!(self.is_last(), "this stage returns hidden states; use run");
+        match self.run(Input::Tokens(tokens)).await? {
+            Output::Token(t) => Ok(t),
+            Output::Hidden(_) => unreachable!("the last stage returns a token"),
+        }
+    }
+
+    /// Runs this stage's layers on `input` and appends it to the context.
+    /// The first stage takes tokens; later stages take the hidden states that
+    /// the stage before them returned. The last stage returns the next token;
+    /// other stages return hidden states.
+    pub async fn run(&mut self, input: Input<'_>) -> Result<Output> {
+        let h = self.config.hidden_size;
+        let n = match input {
+            Input::Tokens(tokens) => {
+                ensure!(
+                    self.is_first(),
+                    "this stage takes hidden states, not tokens"
+                );
+                for &t in tokens {
+                    ensure!(
+                        (t as usize) < self.config.vocab_size,
+                        "token {t} is outside the vocabulary"
+                    );
+                }
+                tokens.len()
+            }
+            Input::Hidden(x) => {
+                ensure!(
+                    !self.is_first(),
+                    "this stage takes tokens, not hidden states"
+                );
+                ensure!(
+                    x.len() % h == 0,
+                    "hidden states are not a multiple of {h} values"
+                );
+                x.len() / h
+            }
+        };
+        ensure!(n > 0, "no tokens");
         ensure!(
-            self.pos + tokens.len() <= MAX_CONTEXT,
+            self.pos + n <= MAX_CONTEXT,
             "context is longer than {MAX_CONTEXT} tokens"
         );
-        for &t in tokens {
-            ensure!(
-                (t as usize) < self.config.vocab_size,
-                "token {t} is outside the vocabulary"
-            );
-        }
-        let chunks: Vec<&[u32]> = tokens.chunks(MAX_CHUNK).collect();
-        let last = chunks.len() - 1;
-        for (i, chunk) in chunks.into_iter().enumerate() {
-            self.queue
-                .write_buffer(&self.tokens, 0, bytemuck::cast_slice(chunk));
-            let mut enc = self.encode_step(chunk.len(), i == last);
-            if i == last {
-                enc.copy_buffer_to_buffer(
-                    &self.history,
-                    4 * self.pos as u64,
-                    &self.next_read,
+        let chunks = n.div_ceil(MAX_CHUNK);
+        let mut hidden = Vec::new();
+        for c in 0..chunks {
+            let start = c * MAX_CHUNK;
+            let len = MAX_CHUNK.min(n - start);
+            match input {
+                Input::Tokens(t) => self.queue.write_buffer(
+                    &self.tokens,
                     0,
-                    4,
-                );
+                    bytemuck::cast_slice(&t[start..start + len]),
+                ),
+                Input::Hidden(x) => self.queue.write_buffer(
+                    &self.x,
+                    0,
+                    bytemuck::cast_slice(&x[start * h..(start + len) * h]),
+                ),
             }
-            self.queue.submit([enc.finish()]);
+            let final_chunk = c + 1 == chunks;
+            let mut enc = self.encode_step(len, self.is_last() && final_chunk);
+            if !self.is_last() {
+                let bytes = (len * h * 4) as u64;
+                enc.copy_buffer_to_buffer(&self.x, 0, &self.hidden_read, 0, bytes);
+                self.queue.submit([enc.finish()]);
+                let raw = read_buffer(&self.device, &self.hidden_read, None).await?;
+                hidden.extend_from_slice(bytemuck::cast_slice::<u8, f32>(&raw[..bytes as usize]));
+            } else {
+                if final_chunk {
+                    // encode_step has moved pos to the new token's position.
+                    enc.copy_buffer_to_buffer(
+                        &self.history,
+                        4 * self.pos as u64,
+                        &self.next_read,
+                        0,
+                        4,
+                    );
+                }
+                self.queue.submit([enc.finish()]);
+            }
+        }
+        if !self.is_last() {
+            return Ok(Output::Hidden(hidden));
         }
         let bytes = read_buffer(&self.device, &self.next_read, None).await?;
-        Ok(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
+        Ok(Output::Token(u32::from_le_bytes(
+            bytes[..4].try_into().unwrap(),
+        )))
     }
 
     /// Generates up to `max` tokens greedily. The first input is the token
@@ -499,6 +632,10 @@ impl Engine {
         max: usize,
         mut on_tokens: impl FnMut(&[u32]) -> bool,
     ) -> Result<()> {
+        ensure!(
+            self.is_first() && self.is_last(),
+            "generate needs a stage with all layers"
+        );
         ensure!(self.pos > 0, "generate needs a forward pass first");
         ensure!(
             self.pos + max <= MAX_CONTEXT,
@@ -639,12 +776,11 @@ impl Engine {
 
     /// Final norm, LM head, then argmax or the sampler.
     fn head_passes(&self) -> impl Iterator<Item = &Pass> {
-        let last = if self.sampling.is_some() {
-            &self.sample
-        } else {
-            &self.head[2]
+        let pick = match (&self.sample, self.sampling) {
+            (Some(sample), Some(_)) => Some(sample),
+            _ => self.head.get(2),
         };
-        self.head[..2].iter().chain(std::iter::once(last))
+        self.head.iter().take(2).chain(pick)
     }
 
     /// Sets random sampling, or greedy decoding with `None`.
@@ -684,7 +820,10 @@ impl Engine {
         let mut enc = self.device.create_command_encoder(&Default::default());
         {
             let mut cp = enc.begin_compute_pass(&Default::default());
-            self.sample.dispatch(&mut cp, 1);
+            self.sample
+                .as_ref()
+                .context("this stage does not pick tokens")?
+                .dispatch(&mut cp, 1);
         }
         enc.copy_buffer_to_buffer(&self.tokens, 0, &self.sample_read, 0, 8);
         self.queue.submit([enc.finish()]);

@@ -1,6 +1,6 @@
 //! Model configuration and MLC `q4f16_1` weight files.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, ops::Range};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
@@ -144,6 +144,36 @@ impl WeightIndex {
         Ok(Self { shards, tensors })
     }
 
+    /// True when a stage running `layers` of a model with `total` layers
+    /// needs tensor `name`.
+    pub fn stage_needs(name: &str, layers: &Range<usize>, total: usize) -> bool {
+        if let Some(rest) = name.strip_prefix("model.layers.") {
+            return rest
+                .split('.')
+                .next()
+                .and_then(|l| l.parse::<usize>().ok())
+                .is_some_and(|l| layers.contains(&l));
+        }
+        let (first, last) = (layers.start == 0, layers.end == total);
+        if name.starts_with("model.embed_tokens.") {
+            return first || last;
+        }
+        name.starts_with("model.norm.") && last
+    }
+
+    /// Indexes of the shard files that hold the tensors for `layers`.
+    pub fn shards_for(&self, layers: &Range<usize>, total: usize) -> Vec<usize> {
+        let mut shards: Vec<usize> = self
+            .tensors
+            .iter()
+            .filter(|(name, _)| Self::stage_needs(name, layers, total))
+            .map(|(_, t)| t.shard)
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        shards
+    }
+
     pub fn get(&self, name: &str) -> Result<&TensorInfo> {
         self.tensors
             .get(name)
@@ -175,7 +205,10 @@ impl Weights {
         let shard = self
             .shards
             .get(t.shard)
-            .with_context(|| format!("missing shard for {name}"))?;
+            .filter(|s| !s.is_empty())
+            .with_context(|| {
+                format!("tensor {name} is in shard {}, which is not loaded", t.shard)
+            })?;
         shard
             .get(t.offset..t.offset + t.nbytes)
             .with_context(|| format!("tensor {name} is outside its shard"))
@@ -183,21 +216,58 @@ impl Weights {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn read_dir(dir: &std::path::Path) -> Result<Self> {
+        Self::read_dir_stage(dir, None)
+    }
+
+    /// Reads only the shard files that `layers` needs; others stay empty.
+    /// With `None`, reads every shard.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn read_dir_stage(dir: &std::path::Path, layers: Option<Range<usize>>) -> Result<Self> {
         let read = |name: &str| {
             std::fs::read_to_string(dir.join(name))
                 .with_context(|| format!("read {}", dir.join(name).display()))
         };
         let config = Config::from_mlc_chat_config(&read("mlc-chat-config.json")?)?;
         let index = WeightIndex::from_ndarray_cache(&read("ndarray-cache.json")?)?;
+        let needed = layers.map(|l| index.shards_for(&l, config.num_hidden_layers));
         let shards = index
             .shards
             .iter()
-            .map(|s| std::fs::read(dir.join(s)).with_context(|| format!("read {s}")))
+            .enumerate()
+            .map(|(i, s)| {
+                if needed.as_ref().is_some_and(|n| !n.contains(&i)) {
+                    return Ok(Vec::new());
+                }
+                std::fs::read(dir.join(s)).with_context(|| format!("read {s}"))
+            })
             .collect::<Result<_>>()?;
         Ok(Self {
             config,
             index,
             shards,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WeightIndex;
+
+    #[test]
+    fn stage_needs_its_layers_and_ends() {
+        let needs = |name: &str, layers: std::ops::Range<usize>| {
+            WeightIndex::stage_needs(name, &layers, 30)
+        };
+        assert!(needs("model.layers.3.mlp.down_proj.q_weight", 0..15));
+        assert!(!needs("model.layers.15.mlp.down_proj.q_weight", 0..15));
+        assert!(needs("model.layers.15.mlp.down_proj.q_weight", 15..30));
+        // "layers.1" must not match "layers.10".
+        assert!(!needs("model.layers.10.self_attn.o_proj.q_scale", 1..2));
+        // The embedding is the input of the first stage and the LM head of the last.
+        assert!(needs("model.embed_tokens.q_weight", 0..15));
+        assert!(needs("model.embed_tokens.q_weight", 15..30));
+        assert!(!needs("model.embed_tokens.q_weight", 10..20));
+        assert!(needs("model.norm.weight", 15..30));
+        assert!(!needs("model.norm.weight", 0..15));
     }
 }
