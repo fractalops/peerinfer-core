@@ -22,7 +22,13 @@ fn main() -> Result<()> {
             };
             pollster::block_on(speed(args[1].as_ref(), n(2, 128)?, n(3, 128)?, n(4, 5)?))
         }
-        Some("profile") if args.len() == 2 => pollster::block_on(profile(args[1].as_ref())),
+        Some("profile") if args.len() >= 2 => {
+            let n = args
+                .get(2)
+                .map_or(Ok(1), |s| s.parse())
+                .context("bad number")?;
+            pollster::block_on(profile(args[1].as_ref(), n))
+        }
         _ => bail!(
             "usage: peerinfer-bench check MODEL_DIR REF_DIR | speed MODEL_DIR [PROMPT] [GEN] [RUNS]"
         ),
@@ -157,12 +163,15 @@ async fn speed(
     Ok(())
 }
 
-async fn profile(model: &std::path::Path) -> Result<()> {
+async fn profile(model: &std::path::Path, n: usize) -> Result<()> {
     let (mut engine, _) = load(model).await?;
     let prompt: Vec<u32> = (0..128u32).map(|i| 1000 + (i * 37) % 20000).collect();
-    let next = engine.forward(&prompt).await?;
-    engine.profile(next).await?; // warm-up
-    let mut rows = engine.profile(next).await?;
+    let pass: Vec<u32> = prompt.iter().copied().cycle().take(n).collect();
+    engine.forward(&prompt).await?;
+    engine.profile(&pass).await?; // warm-up
+    engine.reset();
+    engine.forward(&prompt).await?;
+    let mut rows = engine.profile(&pass).await?;
     if rows.is_empty() {
         bail!("this GPU does not support timestamp queries");
     }
@@ -171,6 +180,6 @@ async fn profile(model: &std::path::Path) -> Result<()> {
     for (name, ms) in rows {
         println!("{ms:7.3} ms {:5.1}%  {name}", 100.0 * ms / total);
     }
-    println!("{total:7.3} ms total GPU time for one decode step at position 128");
+    println!("{total:7.3} ms GPU time for a pass over {n} tokens after 128 cached tokens");
     Ok(())
 }

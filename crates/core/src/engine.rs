@@ -26,8 +26,53 @@ struct Step {
     _pad: [u32; 2],
 }
 
+/// Tiled variant of a matmul pass for forward passes over many tokens.
+struct Tiled {
+    pipeline: wgpu::ComputePipeline,
+    bind: wgpu::BindGroup,
+    reduce: wgpu::ComputePipeline,
+    reduce_bind: wgpu::BindGroup,
+    rows: u32,
+    splits: u32,
+}
+
+/// Target number of workgroups for a tiled matmul over one token tile.
+const TILED_TARGET_WORKGROUPS: usize = 240;
+
+/// Number of K splits for an `n` x `k` matmul.
+fn k_splits(n: usize, k: usize) -> usize {
+    let tiles = n.div_ceil(TILE as usize);
+    let max = (k / 32 / 4).max(1);
+    TILED_TARGET_WORKGROUPS.div_ceil(tiles).clamp(1, max)
+}
+
+impl Pass {
+    fn dispatch(&self, cp: &mut wgpu::ComputePass<'_>, n: usize) {
+        match &self.tiled {
+            Some(t) if n >= TILED_MIN_TOKENS => {
+                cp.set_pipeline(&t.pipeline);
+                cp.set_bind_group(0, &t.bind, &[]);
+                cp.dispatch_workgroups(t.rows.div_ceil(TILE), (n as u32).div_ceil(TILE), t.splits);
+                cp.set_pipeline(&t.reduce);
+                cp.set_bind_group(0, &t.reduce_bind, &[]);
+                cp.dispatch_workgroups((n as u32 * t.rows).div_ceil(256), 1, 1);
+            }
+            _ => {
+                cp.set_pipeline(&self.pipeline);
+                cp.set_bind_group(0, &self.bind, &[]);
+                cp.dispatch_workgroups(self.groups_x, self.fixed_y.unwrap_or(n as u32), 1);
+            }
+        }
+    }
+}
+
+/// Forward passes with at least this many tokens use the tiled matmul.
+const TILED_MIN_TOKENS: usize = 4;
+const TILE: u32 = 32;
+
 struct Pass {
     name: String,
+    tiled: Option<Tiled>,
     pipeline: wgpu::ComputePipeline,
     bind: wgpu::BindGroup,
     /// Workgroups in x; y is the token count unless `fixed_y` is set.
@@ -150,6 +195,18 @@ impl Engine {
         // Token at each position, written by argmax.
         let history = storage("history", (MAX_CONTEXT + 1) * 4);
         let tokens = storage("tokens", MAX_CHUNK * 4);
+        // Partial sums for the tiled matmuls: splits x tokens x output width.
+        let part_len = [
+            (qkv_dim, h, qkv_dim),
+            (h, c.q_dim(), h),
+            (inter, h, 2 * inter),
+            (h, inter, h),
+        ]
+        .iter()
+        .map(|&(n, k, width)| k_splits(n, k) * MAX_CHUNK * width)
+        .max()
+        .unwrap();
+        let part = storage("part", part_len * f);
         let step = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("step"),
             size: std::mem::size_of::<Step>() as u64,
@@ -183,10 +240,6 @@ impl Engine {
             ("BASE", c.position_embedding_base as f64),
         ];
         let norm_consts = [("K", h as f64), ("EPS", c.rms_norm_eps as f64)];
-        let mm = |n: usize, k: usize, mode: u32| {
-            [("N", n as f64), ("K", k as f64), ("MODE", mode as f64)]
-        };
-        let mm_groups = |n: usize| (n as u32).div_ceil(ROWS_PER_WORKGROUP);
 
         let (embed_w, embed_s) = linear("model.embed_tokens", c.vocab_size, h)?;
         let mut passes = vec![kernels.pass(
@@ -222,12 +275,14 @@ impl Engine {
                 1,
                 None,
             )?);
-            passes.push(kernels.pass(
+            passes.push(kernels.matmul(
                 &device,
-                "matmul",
-                &mm(qkv_dim, h, 0),
-                &[&xn, &wqkv, &sqkv, &qkv],
-                mm_groups(qkv_dim),
+                qkv_dim,
+                h,
+                0,
+                [&xn, &wqkv, &sqkv, &qkv],
+                &step,
+                &part,
                 None,
             )?);
             passes.push(kernels.pass(
@@ -246,12 +301,14 @@ impl Engine {
                 c.num_attention_heads as u32,
                 None,
             )?);
-            passes.push(kernels.pass(
+            passes.push(kernels.matmul(
                 &device,
-                "matmul",
-                &mm(h, c.q_dim(), 1),
-                &[&attn, &wo, &so, &x],
-                mm_groups(h),
+                h,
+                c.q_dim(),
+                1,
+                [&attn, &wo, &so, &x],
+                &step,
+                &part,
                 None,
             )?);
             passes.push(kernels.pass(
@@ -262,20 +319,24 @@ impl Engine {
                 1,
                 None,
             )?);
-            passes.push(kernels.pass(
+            passes.push(kernels.matmul(
                 &device,
-                "matmul",
-                &mm(inter, h, 2),
-                &[&xn, &wgu, &sgu, &act],
-                mm_groups(inter),
+                inter,
+                h,
+                2,
+                [&xn, &wgu, &sgu, &act],
+                &step,
+                &part,
                 None,
             )?);
-            passes.push(kernels.pass(
+            passes.push(kernels.matmul(
                 &device,
-                "matmul",
-                &mm(h, inter, 1),
-                &[&act, &wd, &sd, &x],
-                mm_groups(h),
+                h,
+                inter,
+                1,
+                [&act, &wd, &sd, &x],
+                &step,
+                &part,
                 None,
             )?);
         }
@@ -295,12 +356,14 @@ impl Engine {
                 1,
                 Some(1),
             )?,
-            kernels.pass(
+            kernels.matmul(
                 &device,
-                "matmul",
-                &mm(c.vocab_size, h, 0),
-                &[&last, &embed_w, &embed_s, &logits],
-                mm_groups(c.vocab_size),
+                c.vocab_size,
+                h,
+                0,
+                [&last, &embed_w, &embed_s, &logits],
+                &step,
+                &part,
                 Some(1),
             )?,
             kernels.pass(
@@ -446,7 +509,12 @@ impl Engine {
     /// Runs one decode step with each kernel in its own compute pass and
     /// returns GPU time in milliseconds per kernel, summed by name.
     /// Needs timestamp queries; returns an empty list without them.
-    pub async fn profile(&mut self, token: u32) -> Result<Vec<(String, f64)>> {
+    pub async fn profile(&mut self, tokens: &[u32]) -> Result<Vec<(String, f64)>> {
+        let n = tokens.len();
+        ensure!(
+            (1..=MAX_CHUNK).contains(&n),
+            "profile takes 1 to {MAX_CHUNK} tokens"
+        );
         if !self.timestamps {
             return Ok(Vec::new());
         }
@@ -474,13 +542,13 @@ impl Engine {
             &self.step,
             0,
             bytemuck::bytes_of(&Step {
-                tokens: 1,
+                tokens: n as u32,
                 pos0: self.pos as u32,
                 _pad: [0; 2],
             }),
         );
         self.queue
-            .write_buffer(&self.tokens, 0, bytemuck::bytes_of(&token));
+            .write_buffer(&self.tokens, 0, bytemuck::cast_slice(tokens));
         let mut enc = self.device.create_command_encoder(&Default::default());
         for (i, p) in passes.iter().enumerate() {
             let mut cp = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -491,9 +559,7 @@ impl Engine {
                     end_of_pass_write_index: Some(2 * i as u32 + 1),
                 }),
             });
-            cp.set_pipeline(&p.pipeline);
-            cp.set_bind_group(0, &p.bind, &[]);
-            cp.dispatch_workgroups(p.groups_x, p.fixed_y.unwrap_or(1), 1);
+            p.dispatch(&mut cp, n);
         }
         enc.resolve_query_set(&set, 0..count, &resolve, 0);
         enc.copy_buffer_to_buffer(&resolve, 0, &read, 0, None);
@@ -509,7 +575,7 @@ impl Engine {
                 None => totals.push((p.name.clone(), ms)),
             }
         }
-        self.pos += 1;
+        self.pos += n;
         Ok(totals)
     }
 
@@ -532,9 +598,7 @@ impl Engine {
                 .iter()
                 .chain(if with_head { &self.head[..] } else { &[] });
             for p in passes {
-                cp.set_pipeline(&p.pipeline);
-                cp.set_bind_group(0, &p.bind, &[]);
-                cp.dispatch_workgroups(p.groups_x, p.fixed_y.unwrap_or(n as u32), 1);
+                p.dispatch(&mut cp, n);
             }
         }
         self.pos += n;
@@ -602,7 +666,9 @@ struct Kernels {
 
 impl Kernels {
     fn new(device: &wgpu::Device) -> Self {
-        let sources: [(&'static str, &str); 6] = [
+        let sources: [(&'static str, &str); 8] = [
+            ("matmul_tiled", include_str!("kernels/matmul_tiled.wgsl")),
+            ("matmul_reduce", include_str!("kernels/matmul_reduce.wgsl")),
             ("embed", include_str!("kernels/embed.wgsl")),
             ("rmsnorm", include_str!("kernels/rmsnorm.wgsl")),
             ("matmul", include_str!("kernels/matmul.wgsl")),
@@ -679,10 +745,70 @@ impl Kernels {
         };
         Ok(Pass {
             name,
+            tiled: None,
             pipeline,
             bind,
             groups_x,
             fixed_y,
         })
+    }
+}
+
+impl Kernels {
+    /// A matmul pass with both the one-token and the tiled pipeline.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul(
+        &mut self,
+        device: &wgpu::Device,
+        n: usize,
+        k: usize,
+        mode: u32,
+        bufs: [&wgpu::Buffer; 4],
+        step: &wgpu::Buffer,
+        part: &wgpu::Buffer,
+        fixed_y: Option<u32>,
+    ) -> Result<Pass> {
+        let consts = [("N", n as f64), ("K", k as f64), ("MODE", mode as f64)];
+        let mut pass = self.pass(
+            device,
+            "matmul",
+            &consts,
+            &bufs,
+            (n as u32).div_ceil(ROWS_PER_WORKGROUP),
+            fixed_y,
+        )?;
+        if fixed_y.is_none() {
+            let [x, w, s, y] = bufs;
+            let splits = k_splits(n, k);
+            let tconsts = [
+                ("N", n as f64),
+                ("K", k as f64),
+                ("MODE", mode as f64),
+                ("SPLITS", splits as f64),
+            ];
+            let t = self.pass(
+                device,
+                "matmul_tiled",
+                &tconsts,
+                &[x, w, s, part, step],
+                0,
+                None,
+            )?;
+            let rconsts = [
+                ("N", n as f64),
+                ("MODE", mode as f64),
+                ("SPLITS", splits as f64),
+            ];
+            let r = self.pass(device, "matmul_reduce", &rconsts, &[part, y, step], 0, None)?;
+            pass.tiled = Some(Tiled {
+                pipeline: t.pipeline,
+                bind: t.bind,
+                reduce: r.pipeline,
+                reduce_bind: r.bind,
+                rows: n as u32,
+                splits: splits as u32,
+            });
+        }
+        Ok(pass)
     }
 }
